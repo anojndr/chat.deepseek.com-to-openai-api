@@ -23,17 +23,20 @@ from .models import (
     parse_model,
 )
 from .pow_solver import PowSolver
+from .storage import Storage
 from .turn import prepare_turn
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_PATH = Path("/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt")
 if not ACCOUNTS_PATH.exists():
     ACCOUNTS_PATH = ROOT / "accounts.txt"
+DB_PATH = ROOT / "data.sqlite"
 
 app = FastAPI(title="DeepSeek OpenAI-Compatible API", version="1.0.0")
 
 _pool = AccountPool(ACCOUNTS_PATH)
 _solver: PowSolver | None = None
+_storage = Storage(DB_PATH)
 _manager: ConversationManager | None = None
 
 
@@ -83,7 +86,9 @@ async def _startup() -> None:
     if _solver is None:
         _solver = PowSolver()
     if _manager is None:
-        _manager = ConversationManager(_pool, _solver)
+        _manager = ConversationManager(_pool, _solver, storage=_storage)
+    else:
+        _manager.ensure_sweeper()
 
 
 @app.on_event("shutdown")
@@ -625,11 +630,18 @@ def _store_response_link(response_id: str, conversation_key: str, model: str) ->
     _response_links.move_to_end(response_id)
     while len(_response_links) > _RESPONSE_LINK_MAX:
         _response_links.popitem(last=False)
+    _storage.store_response_link(
+        response_id, conversation_key, model, limit=_RESPONSE_LINK_MAX
+    )
 
 
 @app.get("/v1/responses/{response_id}", dependencies=[Depends(require_api_key)])
 async def get_response(response_id: str):
     stored = _response_links.get(response_id)
+    if not stored:
+        stored = _storage.get_response_link(response_id)
+        if stored:
+            _response_links[response_id] = stored
     if not stored:
         return JSONResponse(
             status_code=404,

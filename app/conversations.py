@@ -21,6 +21,7 @@ from .aggregator import FragmentAggregator
 from .citations import CitationRewriter, rewrite_citations
 from .deepseek import DeepSeekClient, DeepSeekError
 from .pow_solver import PowSolver
+from .storage import Storage
 from .turn import PreparedTurn
 
 
@@ -33,8 +34,8 @@ class Conversation:
     parent_message_id: int | None = None
     # full transcript for replay after failover: list of {"role","content"}
     history: list[dict[str, str]] = field(default_factory=list)
-    created_at: float = field(default_factory=time.monotonic)
-    last_used_at: float = field(default_factory=time.monotonic)
+    created_at: float = field(default_factory=time.time)
+    last_used_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -64,14 +65,63 @@ class EmptyCompletion(Exception):
 
 
 class ConversationManager:
-    def __init__(self, pool: AccountPool, pow_solver: PowSolver) -> None:
+    def __init__(self, pool: AccountPool, pow_solver: PowSolver, storage: Storage | None = None) -> None:
         self._pool = pool
         self._solver = pow_solver
+        self._storage = storage
         self._conversations: dict[str, Conversation] = {}
         self._clients: dict[str, DeepSeekClient] = {}  # keyed by account token
         self._lock = asyncio.Lock()  # guards _conversations / _clients maps
         self._key_locks: dict[str, asyncio.Lock] = {}
-        self._sweeper = asyncio.create_task(self._sweep_loop())
+        if self._storage is not None:
+            self._load_from_storage()
+        self._sweeper: asyncio.Task | None = None
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                self._sweeper = loop.create_task(self._sweep_loop())
+        except RuntimeError:
+            # no running event loop yet (e.g. before startup hook or in synchronous tests)
+            self._sweeper = None
+
+    def ensure_sweeper(self) -> None:
+        """Start the background sweep task if not already running."""
+        if self._sweeper is None or self._sweeper.done():
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_running():
+                    self._sweeper = loop.create_task(self._sweep_loop())
+            except RuntimeError:
+                pass
+
+    def _load_from_storage(self) -> None:
+        if self._storage is None:
+            return
+        stored = self._storage.get_all_conversations()
+        for key, data in stored.items():
+            self._conversations[key] = Conversation(
+                id=data["id"],
+                account_index=data["account_index"],
+                account_token=data["account_token"],
+                deepseek_session_id=data["deepseek_session_id"],
+                parent_message_id=data["parent_message_id"],
+                history=data["history"],
+                created_at=data["created_at"],
+                last_used_at=data["last_used_at"],
+            )
+
+    def _persist_conversation(self, conv: Conversation) -> None:
+        if self._storage is not None:
+            self._storage.save_conversation(
+                conv.id,
+                account_index=conv.account_index,
+                account_token=conv.account_token,
+                deepseek_session_id=conv.deepseek_session_id,
+                parent_message_id=conv.parent_message_id,
+                history=conv.history,
+                created_at=conv.created_at,
+                last_used_at=conv.last_used_at,
+            )
 
     def client_for(self, token: str) -> DeepSeekClient:
         client = self._clients.get(token)
@@ -96,7 +146,8 @@ class ConversationManager:
         return lock
 
     async def aclose(self) -> None:
-        self._sweeper.cancel()
+        if self._sweeper is not None:
+            self._sweeper.cancel()
         for client in self._clients.values():
             await client.aclose()
 
@@ -104,9 +155,25 @@ class ConversationManager:
         async with self._lock:
             conv = self._conversations.get(key)
             if conv is None:
-                conv = Conversation(id=key)
-                self._conversations[key] = conv
-            conv.last_used_at = time.monotonic()
+                if self._storage is not None:
+                    data = self._storage.get_conversation(key)
+                    if data is not None:
+                        conv = Conversation(
+                            id=data["id"],
+                            account_index=data["account_index"],
+                            account_token=data["account_token"],
+                            deepseek_session_id=data["deepseek_session_id"],
+                            parent_message_id=data["parent_message_id"],
+                            history=data["history"],
+                            created_at=data["created_at"],
+                            last_used_at=data["last_used_at"],
+                        )
+                        self._conversations[key] = conv
+                if conv is None:
+                    conv = Conversation(id=key)
+                    self._conversations[key] = conv
+            conv.last_used_at = time.time()
+            self._persist_conversation(conv)
             return conv
 
     def _is_first_turn(self, conv: Conversation) -> bool:
@@ -121,10 +188,11 @@ class ConversationManager:
         existing conversation — the caller must replay prior context.
         """
         if conv.deepseek_session_id and conv.account_token:
-            client = self._clients.get(conv.account_token)
-            if client is not None:
-                return client, self._pool.by_token(conv.account_token), False
-            # lost client (pool reloaded): force new session
+            account = self._pool.by_token(conv.account_token)
+            if account is not None:
+                client = self.client_for(conv.account_token)
+                return client, account, False
+            # lost account (token no longer in pool): force new session
             conv.deepseek_session_id = None
             conv.parent_message_id = None
 
@@ -142,6 +210,7 @@ class ConversationManager:
         conv.account_token = account.token
         conv.deepseek_session_id = session_id
         conv.parent_message_id = None
+        self._persist_conversation(conv)
         return client, account, bool(fresh)
 
     @staticmethod
@@ -240,8 +309,8 @@ class ConversationManager:
         model_type: str | None,
     ) -> AsyncIterator[StreamEvent]:
         """Streaming variant; yields deltas as they arrive from DeepSeek."""
-        conv = await self.get_or_create(key)
         async with self.key_lock(key):
+            conv = await self.get_or_create(key)
             async for ev in self._stream_turn_locked(
                 key, conv, prepared, deepthink=deepthink, model_type=model_type
             ):
@@ -486,6 +555,7 @@ class ConversationManager:
                 yield StreamEvent("references", new_refs)
         if response_id is not None:
             conv.parent_message_id = response_id
+            self._persist_conversation(conv)
 
     def _record_history(self, conv: Conversation, prompt: str, answer: str) -> None:
         conv.history.append({"role": "user", "content": prompt})
@@ -494,15 +564,25 @@ class ConversationManager:
         while total > MAX_HISTORY_CHARS and len(conv.history) > 2:
             removed = conv.history.pop(0)
             total -= len(removed["content"])
+        conv.last_used_at = time.time()
+        self._persist_conversation(conv)
 
     def transcript(self, key: str) -> list[dict[str, str]]:
         conv = self._conversations.get(key)
-        return list(conv.history) if conv else []
+        if conv:
+            return list(conv.history)
+        if self._storage is not None:
+            data = self._storage.get_conversation(key)
+            if data and data.get("history"):
+                return list(data["history"])
+        return []
 
     async def reset(self, key: str) -> None:
         async with self.key_lock(key):
             async with self._lock:
                 conv = self._conversations.pop(key, None)
+            if self._storage is not None:
+                self._storage.delete_conversation(key)
         if conv and conv.account_token and conv.deepseek_session_id:
             client = self._clients.get(conv.account_token)
             if client:
@@ -512,7 +592,7 @@ class ConversationManager:
         while True:
             try:
                 await asyncio.sleep(SWEEP_INTERVAL)
-                now = time.monotonic()
+                now = time.time()
                 async with self._lock:
                     stale = [
                         k

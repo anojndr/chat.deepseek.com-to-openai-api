@@ -9,6 +9,10 @@ accounts.txt
 # Runtime artifacts
 server.log
 *.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
 
 dist/
 build/
