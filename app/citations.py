@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 
 _CITE = re.compile(r"\[citation:(\d+)\]")
+_ADJACENT = re.compile(r"(\[citation:\d+\])(?=\[citation:)")
 # any strict prefix of "[citation:" plus optional digits — held back until complete
 _PARTIAL = re.compile(r"\[(?:c(?:i(?:t(?:a(?:t(?:i(?:o(?:n)?)?|on)?|io)?|at)?|ta)?|it)?|cita)?(?:tion)?:?\d{0,6}$", re.IGNORECASE)
 _HEAD = "[citation:]"
@@ -43,6 +44,7 @@ class CitationRewriter:
         # fragments arrive, always before any content that cites them
         self._refs = reference_urls
         self._pending = ""
+        self._ended_with_cite = False
 
     def _replace(self, match: re.Match[str]) -> str:
         n = int(match.group(1))
@@ -55,16 +57,23 @@ class CitationRewriter:
     def feed(self, text: str) -> str:
         buf = self._pending + text
         self._pending = ""
+        if self._ended_with_cite and buf.startswith("[citation:"):
+            buf = " " + buf
+            self._ended_with_cite = False
+        buf = _ADJACENT.sub(r"\1 ", buf)
         out = _CITE.sub(self._replace, buf)
         hold = _holdback_len(out)
         if hold:
             self._pending = out[-hold:]
             out = out[: -hold]
+        if out:
+            self._ended_with_cite = bool(re.search(r"(\[citation:\d+\](?:\([^)]*\))?)$", out))
         return out
 
     def finish(self) -> str:
         rest = self._pending
         self._pending = ""
+        self._ended_with_cite = False
         return rest
 
 
