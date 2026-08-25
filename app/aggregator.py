@@ -26,6 +26,8 @@ class FragmentAggregator:
         # index into self.fragments of the fragment receiving implicit appends
         self.current = -1
         self._pending: list[str] = []
+        # search-result URLs in arrival order; citation N = reference_urls[N-1]
+        self.reference_urls: list[str | None] = []
 
     # -- public ------------------------------------------------------------
 
@@ -52,6 +54,8 @@ class FragmentAggregator:
                 content = frag.get("content")
                 if content:
                     yield self._kind(frag), str(content)
+                if ftype in ("TOOL_SEARCH", "SEARCH"):
+                    self._capture_results(frag.get("results"))
                 queries = frag.get("queries")
                 if isinstance(queries, list) and queries:
                     yield "search", [
@@ -93,6 +97,14 @@ class FragmentAggregator:
             return "search"
         return "content"
 
+    def _capture_results(self, value: Any) -> None:
+        """Record search-result URLs (positional; None when a result lacks one)."""
+        if not isinstance(value, list):
+            return
+        for item in value:
+            url = item.get("url") if isinstance(item, dict) else None
+            self.reference_urls.append(str(url) if url else None)
+
     def _is_content_frag(self, frag: dict[str, Any]) -> bool:
         return frag.get("type", "") in ("", "RESPONSE")
 
@@ -132,6 +144,7 @@ class FragmentAggregator:
                         # park current so implicit text buffers until the
                         # RESPONSE/THINK fragment shows up
                         self.current = -1
+                        self._capture_results(frag.get("results"))
                         queries = frag.get("queries")
                         if isinstance(queries, list) and queries:
                             yield "search", [
@@ -169,13 +182,20 @@ class FragmentAggregator:
             tail = parts_after[-1]
             if frag is None or tail == "-1":
                 return
+            if tail == "results" and op in ("SET", "APPEND"):
+                items = value if isinstance(value, list) else [value]
+                for it in items:
+                    if isinstance(it, dict):
+                        self._capture_results([it])
+                frag[tail] = value
+                return
             if op == "SET":
                 frag[tail] = value
                 if tail == "content" and isinstance(value, str) and value:
                     yield self._kind(frag), value
             elif op == "APPEND":
                 if tail != "content":
-                    # results/references etc.: update state only — stringified
+                    # references etc.: update state only — stringified
                     # metadata must never leak out as answer text
                     frag[tail] = value
                     return

@@ -18,6 +18,7 @@ from typing import Any
 
 from .accounts import AccountPool
 from .aggregator import FragmentAggregator
+from .citations import CitationRewriter, rewrite_citations
 from .deepseek import DeepSeekClient, DeepSeekError
 from .pow_solver import PowSolver
 from .turn import PreparedTurn
@@ -286,6 +287,7 @@ class ConversationManager:
             buffer_content: list[str] = []
             buffer_reasoning: list[str] = []
             searches: list[Any] = []
+            reference_urls: list[str | None] = []
             emitted = False
             effective_model = model_type or ("vision" if file_ids else None)
             try:
@@ -297,10 +299,13 @@ class ConversationManager:
                     thinking_enabled=deepthink,
                     model_type=effective_model,
                 ):
-                    if ev.kind == "content":
+                    if ev.kind == "references":
+                        reference_urls.extend(ev.value if isinstance(ev.value, list) else [])
+                    elif ev.kind == "content":
+                        # Hold content until the stream finishes: DeepSeek can
+                        # send result URLs after the cited text, so rewriting
+                        # each delta immediately would leak bare markers.
                         buffer_content.append(str(ev.value))
-                        emitted = True
-                        yield ev
                     elif ev.kind == "reasoning":
                         buffer_reasoning.append(str(ev.value))
                         emitted = True
@@ -311,7 +316,11 @@ class ConversationManager:
                         if isinstance(ev.value, list):
                             searches.extend(ev.value)
                         emitted = True
-                text = "".join(buffer_content)
+                raw_text = "".join(buffer_content)
+                text = rewrite_citations(raw_text, reference_urls)
+                if text:
+                    emitted = True
+                    yield StreamEvent("content", text)
                 reasoning = "".join(buffer_reasoning)
                 if not text:
                     # No RESPONSE fragment (refusal / answer stuck in THINK /
@@ -425,8 +434,9 @@ class ConversationManager:
                 reasoning_parts.append(frag.get("content") or "")
             elif ftype in ("", "RESPONSE"):
                 content_parts.append(frag.get("content") or "")
+        content = rewrite_citations("".join(content_parts), agg.reference_urls)
         return TurnResult(
-            content="".join(content_parts),
+            content=content,
             reasoning="".join(reasoning_parts) or None,
             title=title,
         )
@@ -443,6 +453,7 @@ class ConversationManager:
     ) -> AsyncIterator[StreamEvent]:
         agg = FragmentAggregator()
         response_id: int | None = None
+        announced_refs = 0
         async for event in client.stream_completion(
             prompt=prompt,
             chat_session_id=conv.deepseek_session_id or "",
@@ -458,12 +469,18 @@ class ConversationManager:
                 if isinstance(rid, int):
                     response_id = rid
                 continue
+            emitted_from_patch = False
             for kind, value in agg.apply(event.get("event"), event.get("data")):
+                emitted_from_patch = True
                 if kind in ("content", "reasoning"):
                     if value:
                         yield StreamEvent(kind, value)
                 elif kind == "search":
                     yield StreamEvent("search", value)
+            if len(agg.reference_urls) > announced_refs:
+                new_refs = agg.reference_urls[announced_refs:]
+                announced_refs = len(agg.reference_urls)
+                yield StreamEvent("references", new_refs)
         if response_id is not None:
             conv.parent_message_id = response_id
 

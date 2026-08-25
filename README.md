@@ -71,6 +71,7 @@ mode; reasoning streams as `reasoning_content` deltas (Chat) /
 ## Behavior
 
 - **Search is always on** (`search_enabled: true` on every completion).
+- **Search citations are linked**: `[citation:N]` markers are rewritten to Markdown links using the corresponding DeepSeek search-result URL, in both streaming and non-streaming responses.
 - **Multi-turn**: pass a stable `X-Session-Id` header to pin one DeepSeek
   chat_session per conversation. Turn 1 sends the whole conversation; later
   turns send only the latest user message and continue via

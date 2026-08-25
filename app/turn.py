@@ -189,5 +189,3 @@ def prepare_turn(
             prepared_files.append((ensure_extension(filename, mime), raw, mime))
 
     return PreparedTurn(prompt=prompt, files=prepared_files)
-
-    return PreparedTurn(prompt=prompt, files=prepared_files)
