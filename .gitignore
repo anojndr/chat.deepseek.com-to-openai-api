@@ -1,10 +1,17 @@
 # Secrets — never publish
 accounts.txt
 *.token
+.env
+.env.*
+*.key
+*.pem
 
 # Runtime artifacts
 server.log
 *.log
+
+dist/
+build/
 
 # Python
 __pycache__/

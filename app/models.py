@@ -35,39 +35,65 @@ class ModelSpec(BaseModel):
         return self.requested
 
 
+# models whose DeepSeek semantics imply thinking by default
+_THINK_BY_DEFAULT = {"deepseek-reasoner", "deepseek-r1"}
+
+
 def parse_model(model: str | None) -> ModelSpec:
     raw = (model or MODEL_BASE).strip()
     spec = ModelSpec(requested=raw)
-    if raw.endswith(DEEPTHINK_SUFFIX):
+    lowered = raw.lower()
+
+    # strip thinking suffixes case-insensitively ("-deepthink", "-think",
+    # "-thinking" in any casing)
+    stripped = re.sub(r"-(?:deep)?think(?:ing)?$", "", lowered)
+    if stripped != lowered:
         spec.deepthink = True
-        raw = raw[: -len(DEEPTHINK_SUFFIX)]
-    elif raw.endswith("-thinking") or raw.endswith("-think"):
+    lowered = stripped
+
+    alias = MODEL_ALIASES.get(lowered, "__unknown__")
+    if alias == "__unknown__":
+        # Unknown ids still route to the default model; echo the requested id.
+        return spec
+    spec.base = lowered
+    spec.model_type = alias
+    if lowered in _THINK_BY_DEFAULT:
         spec.deepthink = True
-        raw = re.sub(r"-(?:deep)?think(?:ing)?$", "", raw)
-    alias = MODEL_ALIASES.get(raw.lower(), "__unknown__")
-    spec.base = MODEL_BASE if alias == "__unknown__" else raw.lower()
-    if alias != "__unknown__":
-        spec.model_type = alias
     return spec
 
 
 # -- content part helpers ---------------------------------------------------
 
 
-def decode_data_url(url: str) -> tuple[bytes, str] | None:
-    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
-    if not match:
-        return None
-    mime = match.group(1) or "text/plain"
-    payload = match.group(3)
-    if match.group(2):  # base64 flag
-        try:
-            return base64.b64decode(payload, validate=False), mime
-        except (binascii.Error, ValueError):
-            return None
-    from urllib.parse import unquote_to_bytes
+MAX_DATA_URL_BYTES = 25 * 1024 * 1024  # 25 MB decoded cap
 
-    return unquote_to_bytes(payload), mime
+
+def decode_data_url(url: str) -> tuple[bytes, str] | None:
+    """Decode a data: URL, tolerating media-type params (charset etc.).
+
+    Returns (bytes, mime) or None when the URL is malformed or oversized.
+    """
+    head, sep, payload = url.partition(",")
+    if not sep or not head.startswith("data:"):
+        return None
+    meta = head[len("data:") :]
+    parts = [s.strip().lower() for s in meta.split(";") if s.strip()]
+    mime = parts[0] if parts and "/" in parts[0] else "text/plain"
+    is_base64 = "base64" in parts[1:]
+    if len(payload) > MAX_DATA_URL_BYTES * 2:  # rough pre-decode guard
+        return None
+    try:
+        if is_base64:
+            decoded = base64.b64decode(payload, validate=False)
+        else:
+            from urllib.parse import unquote_to_bytes
+
+            decoded = unquote_to_bytes(payload)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > MAX_DATA_URL_BYTES:
+        return None
+    return decoded, mime
 
 
 def guess_mime(filename: str) -> str:

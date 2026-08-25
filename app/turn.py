@@ -8,12 +8,12 @@ uploaded once per new conversation and referenced via ref_file_ids.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from .models import decode_data_url
 
 
 @dataclass
@@ -77,20 +77,7 @@ def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]]]:
     return "\n".join(p for p in parts_out if p), files
 
 
-def _data_to_bytes(url: str) -> tuple[bytes, str] | None:
-    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url or "", re.DOTALL)
-    if not match:
-        return None
-    mime = match.group(1) or "application/octet-stream"
-    payload = match.group(3)
-    try:
-        if match.group(2):
-            return base64.b64decode(payload, validate=False), mime
-        from urllib.parse import unquote_to_bytes
 
-        return unquote_to_bytes(payload), mime
-    except (binascii.Error, ValueError):
-        return None
 
 
 _MIME_EXT = {
@@ -190,9 +177,9 @@ def prepare_turn(
         url = f.get("url") or ""
         file_data = f.get("file_data") or ""
         if url.startswith("data:"):
-            decoded = _data_to_bytes(url)
+            decoded = decode_data_url(url)
         elif file_data.startswith("data:"):
-            decoded = _data_to_bytes(file_data)
+            decoded = decode_data_url(file_data)
         else:
             # http(s) URLs are left alone on purpose: downloading arbitrary
             # remote content server-side would be a surprise side effect.

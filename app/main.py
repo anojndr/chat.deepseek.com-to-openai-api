@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .accounts import AccountPool
@@ -38,6 +40,41 @@ _manager: ConversationManager | None = None
 def manager() -> "ConversationManager":
     assert _manager is not None, "startup hook has not run"
     return _manager
+
+
+API_KEY: str | None = os.environ.get("API_KEY")
+
+
+class MissingApiKey(Exception):
+    pass
+
+
+async def require_api_key(request: Request) -> None:
+    """Bearer-key gate, active only when the API_KEY env var is set."""
+    if not API_KEY:
+        return
+    header = request.headers.get("authorization", "")
+    provided = (
+        header[7:].strip() if header.startswith("Bearer ") else request.headers.get("x-api-key", "")
+    )
+    if provided != API_KEY:
+        # must raise: returning a Response from a dependency does not
+        # short-circuit the route in FastAPI
+        raise MissingApiKey("invalid or missing API key")
+
+
+@app.exception_handler(MissingApiKey)
+async def _missing_api_key_handler(request: Request, exc: MissingApiKey):
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": {
+                "message": str(exc),
+                "type": "invalid_api_key",
+                "code": "invalid_api_key",
+            }
+        },
+    )
 
 
 @app.on_event("startup")
@@ -148,10 +185,16 @@ async def list_models() -> dict:
     return {"object": "list", "data": models}
 
 
-@app.post("/accounts/reload")
+@app.post("/accounts/reload", dependencies=[Depends(require_api_key)])
 async def reload_accounts() -> dict:
     count = _pool.reload()
-    return {"status": "reloaded", "accounts": count, "detail": _pool.snapshot()}
+    removed = await manager().invalidate_clients(set(_pool.tokens()))
+    return {
+        "status": "reloaded",
+        "accounts": count,
+        "stale_clients_closed": removed,
+        "detail": _pool.snapshot(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +202,7 @@ async def reload_accounts() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/v1/chat/completions", response_model=None)
+@app.post("/v1/chat/completions", response_model=None, dependencies=[Depends(require_api_key)])
 async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
     try:
         body = ChatCompletionRequest(**(await request.json()))
@@ -245,7 +288,7 @@ async def _chat_stream(
         )
 
     yield chunk({"role": "assistant", "content": ""})
-    usage_tokens = 0
+    completion_est = 0
     try:
         async for ev in manager().stream_turn(
             key, prepared, deepthink=spec.deepthink, model_type=spec.model_type
@@ -254,13 +297,13 @@ async def _chat_stream(
                 yield chunk({"reasoning_content": str(ev.value)})
             elif ev.kind == "content":
                 text = str(ev.value)
-                usage_tokens += len(text)
+                completion_est += _estimate(text)
                 yield chunk({"content": text})
             elif ev.kind == "search":
                 continue
+        prompt_est = _estimate(prepared.prompt)
         yield chunk({}, finish="stop")
         if include_usage:
-            prompt_est = _estimate(prepared.prompt)
             yield _sse(
                 {
                     "id": completion_id,
@@ -270,23 +313,16 @@ async def _chat_stream(
                     "choices": [],
                     "usage": {
                         "prompt_tokens": prompt_est,
-                        "completion_tokens": usage_tokens,
-                        "total_tokens": prompt_est + usage_tokens,
+                        "completion_tokens": completion_est,
+                        "total_tokens": prompt_est + completion_est,
                     },
                 }
             )
         yield "data: [DONE]\n\n"
     except DeepSeekError as exc:
-        payload = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_id,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "error": {"message": str(exc), "type": "upstream_error"},
-        }
-        yield _sse(payload)
-        yield "data: [DONE]\n\n"
+        # OpenAI SDKs raise when an SSE payload carries a top-level "error";
+        # emit that (no finish_reason, no [DONE]) so truncation is visible.
+        yield _sse({"error": {"message": str(exc), "type": "upstream_error", "code": exc.biz_code}})
 
 
 def _estimate(text: str) -> int:
@@ -299,7 +335,7 @@ def _estimate(text: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/v1/responses", response_model=None)
+@app.post("/v1/responses", response_model=None, dependencies=[Depends(require_api_key)])
 async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
     try:
         body = ResponsesRequest(**(await request.json()))
@@ -316,7 +352,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
                 404,
                 "invalid_request_error",
             )
-        key = stored
+        key = stored["conversation"]
 
     items = _normalize_responses_input(body.input)
     if body.instructions:
@@ -412,7 +448,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
         "output_tokens_details": {"reasoning_tokens": _estimate(result.reasoning or "")},
         "total_tokens": _estimate(prepared.prompt) + _estimate(result.content),
     }
-    _store_response_link(response_id, key)
+    _store_response_link(response_id, key, spec.wire_id)
     return JSONResponse(final)
 
 
@@ -531,7 +567,7 @@ async def _responses_stream(
             "output_tokens_details": {"reasoning_tokens": _estimate("".join(reasoning_text))},
             "total_tokens": _estimate(prepared.prompt) + _estimate(text),
         }
-        _store_response_link(response_id, key)
+        _store_response_link(response_id, key, spec.wire_id)
         yield event("response.completed", {"response": final})
     except DeepSeekError as exc:
         failed = base_response("failed")
@@ -574,21 +610,33 @@ def _normalize_responses_input(value) -> list[dict]:
     return out
 
 
-_response_links: dict[str, str] = {}
+_RESPONSE_LINK_MAX = 10_000
+_response_links: "OrderedDict[str, dict]" = OrderedDict()
 
 
-def _store_response_link(response_id: str, conversation_key: str) -> None:
-    if len(_response_links) > 10_000:
-        _response_links.clear()
-    _response_links[response_id] = conversation_key
+def _store_response_link(response_id: str, conversation_key: str, model: str) -> None:
+    """LRU-bounded map so old ids age out one-by-one (never a mass wipe)."""
+    _response_links[response_id] = {"conversation": conversation_key, "model": model}
+    _response_links.move_to_end(response_id)
+    while len(_response_links) > _RESPONSE_LINK_MAX:
+        _response_links.popitem(last=False)
 
 
-@app.get("/v1/responses/{response_id}")
-async def get_response(response_id: str) -> dict:
+@app.get("/v1/responses/{response_id}", dependencies=[Depends(require_api_key)])
+async def get_response(response_id: str):
     stored = _response_links.get(response_id)
     if not stored:
-        raise HTTPException(status_code=404, detail="response not found")
-    transcript = manager().transcript(stored)
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"no response found with id '{response_id}'",
+                    "type": "invalid_request_error",
+                    "code": None,
+                }
+            },
+        )
+    transcript = manager().transcript(stored["conversation"])
     last_answer = next(
         (m["content"] for m in reversed(transcript) if m["role"] == "assistant"), ""
     )
@@ -596,7 +644,7 @@ async def get_response(response_id: str) -> dict:
         "id": response_id,
         "object": "response",
         "status": "completed",
-        "model": MODEL_BASE,
+        "model": stored["model"],
         "output": [
             {
                 "type": "message",
@@ -609,7 +657,7 @@ async def get_response(response_id: str) -> dict:
     }
 
 
-@app.delete("/v1/sessions/{key}")
+@app.delete("/v1/sessions/{key}", dependencies=[Depends(require_api_key)])
 async def delete_session(key: str) -> dict:
     await manager().reset(key)
     return {"status": "deleted", "session": key}

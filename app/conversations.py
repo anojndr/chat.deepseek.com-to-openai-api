@@ -27,6 +27,7 @@ from .turn import PreparedTurn
 class Conversation:
     id: str
     account_index: int | None = None
+    account_token: str | None = None
     deepseek_session_id: str | None = None
     parent_message_id: int | None = None
     # full transcript for replay after failover: list of {"role","content"}
@@ -53,21 +54,45 @@ SESSION_TTL = 6 * 3600.0
 SWEEP_INTERVAL = 900.0
 
 
+class EmptyCompletion(Exception):
+    """Upstream answered with no content (refusal, mute, empty stream).
+
+    Rotates to another account but never poisons the pool's health state:
+    an empty answer is not proof an account is broken.
+    """
+
+
 class ConversationManager:
     def __init__(self, pool: AccountPool, pow_solver: PowSolver) -> None:
         self._pool = pool
         self._solver = pow_solver
         self._conversations: dict[str, Conversation] = {}
-        self._clients: dict[int, DeepSeekClient] = {}
-        self._lock = asyncio.Lock()
+        self._clients: dict[str, DeepSeekClient] = {}  # keyed by account token
+        self._lock = asyncio.Lock()  # guards _conversations / _clients maps
+        self._key_locks: dict[str, asyncio.Lock] = {}
         self._sweeper = asyncio.create_task(self._sweep_loop())
 
-    def client_for(self, account_index: int, token: str) -> DeepSeekClient:
-        client = self._clients.get(account_index)
-        if client is None:
+    def client_for(self, token: str) -> DeepSeekClient:
+        client = self._clients.get(token)
+        if client is None or client.token != token:
             client = DeepSeekClient(token, self._solver)
-            self._clients[account_index] = client
+            self._clients[token] = client
         return client
+
+    async def invalidate_clients(self, keep_tokens: set[str]) -> int:
+        """Drop clients for tokens no longer present in the pool."""
+        stale = [t for t in self._clients if t not in keep_tokens]
+        for t in stale:
+            client = self._clients.pop(t, None)
+            if client:
+                await client.aclose()
+        return len(stale)
+
+    def key_lock(self, key: str) -> asyncio.Lock:
+        lock = self._key_locks.get(key)
+        if lock is None:
+            lock = self._key_locks[key] = asyncio.Lock()
+        return lock
 
     async def aclose(self) -> None:
         self._sweeper.cancel()
@@ -86,27 +111,46 @@ class ConversationManager:
     def _is_first_turn(self, conv: Conversation) -> bool:
         return conv.deepseek_session_id is None
 
-    async def _ensure_session(self, conv: Conversation) -> tuple[DeepSeekClient, int]:
-        """Return (client, account_index); (re)create session when needed."""
-        if conv.deepseek_session_id and conv.account_index is not None:
-            client = self._clients.get(conv.account_index)
+    async def _ensure_session(
+        self, conv: Conversation
+    ) -> tuple[DeepSeekClient, Account, bool]:
+        """Return (client, account, fresh_session).
+
+        fresh_session is True when a new DeepSeek session was created for an
+        existing conversation — the caller must replay prior context.
+        """
+        if conv.deepseek_session_id and conv.account_token:
+            client = self._clients.get(conv.account_token)
             if client is not None:
-                return client, conv.account_index
+                return client, self._pool.by_token(conv.account_token), False
             # lost client (pool reloaded): force new session
             conv.deepseek_session_id = None
             conv.parent_message_id = None
 
         account = self._pool.acquire()
-        client = self.client_for(account.index, account.token)
+        client = self.client_for(account.token)
         try:
             session_id = await client.create_session()
         except Exception as exc:
-            self._pool.mark_failure(account)
-            raise DeepSeekError(f"could not create session on account {account.index}: {exc}") from exc
+            self._pool.mark_failure(account.token)
+            raise DeepSeekError(
+                f"could not create session on account {account.index}: {exc}"
+            ) from exc
+        fresh = conv.history and conv.deepseek_session_id != session_id
         conv.account_index = account.index
+        conv.account_token = account.token
         conv.deepseek_session_id = session_id
         conv.parent_message_id = None
-        return client, account.index
+        return client, account, bool(fresh)
+
+    @staticmethod
+    def _replay_prompt(conv: Conversation, prepared: PreparedTurn) -> PreparedTurn:
+        """Rebuild a first-turn-style prompt from stored history after failover."""
+        lines: list[str] = []
+        for msg in conv.history:
+            lines.append(f"[{msg['role']}] {msg['content']}")
+        lines.append(prepared.prompt)
+        return PreparedTurn(prompt="\n\n".join(lines).strip(), files=prepared.files)
 
     async def run_turn(
         self,
@@ -117,20 +161,42 @@ class ConversationManager:
         model_type: str | None,
         max_retries: int | None = None,
     ) -> TurnResult:
+        async with self.key_lock(key):
+            return await self._run_turn_locked(key, prepared, deepthink=deepthink, model_type=model_type, max_retries=max_retries)
+
+    async def _run_turn_locked(
+        self,
+        key: str,
+        prepared: PreparedTurn,
+        *,
+        deepthink: bool,
+        model_type: str | None,
+        max_retries: int | None = None,
+    ) -> TurnResult:
         conv = await self.get_or_create(key)
-        attempts = max_retries or len(self._pool.snapshot()) or 1
+        attempts = max_retries or self._pool.size or 1
         last_error: Exception | None = None
+        last_ds_error: DeepSeekError | None = None
 
         for attempt in range(max(attempts, 1)):
-            first_turn = self._is_first_turn(conv)
-            replay = first_turn and attempt > 0
+            prev_session = conv.deepseek_session_id
+            account_token: str | None = None
             try:
-                client, account_index = await self._ensure_session(conv)
-                file_ids = await self._upload_files(client, conv, prepared, replay=replay)
-                effective_model = "vision" if file_ids else model_type
+                client, account, fresh_session = await self._ensure_session(conv)
+                account_token = account.token
+                turn_prepared = prepared
+                if fresh_session and conv.history:
+                    # session lost mid-conversation (failover): replay context
+                    turn_prepared = self._replay_prompt(conv, prepared)
+                elif not fresh_session and conv.history and prev_session is None:
+                    turn_prepared = self._replay_prompt(conv, prepared)
+                file_ids = await self._upload_files(client, conv, turn_prepared)
+                # explicit caller model wins; auto-select vision only when the
+                # caller left it unspecified but files need vision parsing
+                effective_model = model_type or ("vision" if file_ids else None)
                 result = await self._collect(
                     client,
-                    prompt=prepared.prompt if not replay else prepared.prompt,
+                    prompt=turn_prepared.prompt,
                     conv=conv,
                     ref_file_ids=file_ids,
                     thinking_enabled=deepthink,
@@ -138,19 +204,31 @@ class ConversationManager:
                     model_type=effective_model,
                 )
                 if not result.content:
-                    # silent empty stream (e.g. muted/rate-limited account) ->
-                    # treat as failure and rotate to the next account
-                    raise RuntimeError("empty completion from upstream")
+                    # refusal / muted / empty stream. Rotate attempts WITHOUT
+                    # poisoning pool health: an empty answer is not proof the
+                    # account is broken.
+                    raise EmptyCompletion("empty completion from upstream")
+                self._record_history(conv, turn_prepared.prompt, result.content)
+                self._pool.mark_success(account.token)
                 return result
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # upstream refusal/network -> rotate
+            except EmptyCompletion as exc:
                 last_error = exc
-                self._pool.mark_failure_by_index(conv.account_index)
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
                 continue
-        raise DeepSeekError(f"all accounts failed for this turn: {last_error}")
+            except Exception as exc:
+                last_error = exc
+                if isinstance(exc, DeepSeekError):
+                    last_ds_error = exc
+                if account_token:
+                    self._pool.mark_failure(account_token)
+                conv.deepseek_session_id = None
+                conv.parent_message_id = None
+                continue
+        final = last_ds_error or DeepSeekError(f"all accounts failed for this turn: {last_error}")
+        raise final
 
     async def stream_turn(
         self,
@@ -162,30 +240,58 @@ class ConversationManager:
     ) -> AsyncIterator[StreamEvent]:
         """Streaming variant; yields deltas as they arrive from DeepSeek."""
         conv = await self.get_or_create(key)
-        attempts = max(len(self._pool.snapshot()), 1)
+        async with self.key_lock(key):
+            async for ev in self._stream_turn_locked(
+                key, conv, prepared, deepthink=deepthink, model_type=model_type
+            ):
+                yield ev
+
+    async def _stream_turn_locked(
+        self,
+        key: str,
+        conv: Conversation,
+        prepared: PreparedTurn,
+        *,
+        deepthink: bool,
+        model_type: str | None,
+    ) -> AsyncIterator[StreamEvent]:
+        attempts = max(self._pool.size, 1)
         last_error: Exception | None = None
+        last_ds_error: DeepSeekError | None = None
 
         for attempt in range(attempts):
-            first_turn = self._is_first_turn(conv)
+            prev_session = conv.deepseek_session_id
+            account_token: str | None = None
             try:
-                client, account_index = await self._ensure_session(conv)
-                file_ids = await self._upload_files(client, conv, prepared)
+                client, account, fresh_session = await self._ensure_session(conv)
+                account_token = account.token
+                turn_prepared = prepared
+                if fresh_session and conv.history:
+                    turn_prepared = self._replay_prompt(conv, prepared)
+                elif not fresh_session and conv.history and prev_session is None:
+                    turn_prepared = self._replay_prompt(conv, prepared)
+                file_ids = await self._upload_files(client, conv, turn_prepared)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # muted/rate-limited/network -> rotate
                 last_error = exc
-                self._pool.mark_failure_by_index(conv.account_index)
+                if isinstance(exc, DeepSeekError):
+                    last_ds_error = exc
+                if account_token:
+                    self._pool.mark_failure(account_token)
                 conv.deepseek_session_id = None
+                conv.parent_message_id = None
                 continue
 
             buffer_content: list[str] = []
             buffer_reasoning: list[str] = []
+            searches: list[Any] = []
             emitted = False
-            effective_model = "vision" if file_ids else model_type
+            effective_model = model_type or ("vision" if file_ids else None)
             try:
                 async for ev in self._stream_events(
                     client,
-                    prompt=prepared.prompt,
+                    prompt=turn_prepared.prompt,
                     conv=conv,
                     ref_file_ids=file_ids,
                     thinking_enabled=deepthink,
@@ -193,36 +299,55 @@ class ConversationManager:
                 ):
                     if ev.kind == "content":
                         buffer_content.append(str(ev.value))
+                        emitted = True
+                        yield ev
                     elif ev.kind == "reasoning":
                         buffer_reasoning.append(str(ev.value))
-                    elif ev.kind == "search":
-                        yield StreamEvent("search", ev.value)
-                        continue
-                    emitted = True
-                    yield ev
-                if not emitted:
-                    yield StreamEvent("meta", {"empty": True})
+                        emitted = True
+                        yield ev
+                    else:
+                        # search/meta events are buffered so retries never
+                        # duplicate output the client already received
+                        if isinstance(ev.value, list):
+                            searches.extend(ev.value)
+                        emitted = True
                 text = "".join(buffer_content)
                 reasoning = "".join(buffer_reasoning)
                 if not text:
-                    # No RESPONSE fragment (answer stuck in THINK or silent
-                    # stream): retry on another attempt/account.
-                    raise RuntimeError("completion returned no content")
-                self._record_history(conv, prepared.prompt, text)
-                self._pool.mark_success_by_index(account_index)
+                    # No RESPONSE fragment (refusal / answer stuck in THINK /
+                    # silent stream): rotate WITHOUT poisoning pool health and
+                    # without having emitted any content to the client.
+                    raise EmptyCompletion("completion returned no content")
+                if searches:
+                    yield StreamEvent("search", searches)
+                self._record_history(conv, turn_prepared.prompt, text)
+                self._pool.mark_success(account_token or "")
                 return
             except asyncio.CancelledError:
                 raise
+            except EmptyCompletion as exc:
+                last_error = exc
+                conv.deepseek_session_id = None
+                conv.parent_message_id = None
+                continue
             except Exception as exc:
                 last_error = exc
-                self._pool.mark_failure_by_index(account_index)
+                if isinstance(exc, DeepSeekError):
+                    last_ds_error = exc
+                if account_token:
+                    self._pool.mark_failure(account_token)
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
                 if emitted:
-                    # mid-stream failure after output started: surface error
-                    raise DeepSeekError(f"stream interrupted: {exc}") from exc
+                    # mid-stream failure after content was streamed: surface
+                    raise DeepSeekError(
+                        f"stream interrupted: {exc}",
+                        status=getattr(exc, "status", None),
+                        biz_code=getattr(exc, "biz_code", None),
+                    ) from exc
                 continue
-        raise DeepSeekError(f"all accounts failed for this turn: {last_error}")
+        final = last_ds_error or DeepSeekError(f"all accounts failed for this turn: {last_error}")
+        raise final
 
     # -- internals -----------------------------------------------------------
 
@@ -355,20 +480,32 @@ class ConversationManager:
         return list(conv.history) if conv else []
 
     async def reset(self, key: str) -> None:
-        async with self._lock:
-            conv = self._conversations.pop(key, None)
-        if conv and conv.account_index is not None and conv.deepseek_session_id:
-            client = self._clients.get(conv.account_index)
+        async with self.key_lock(key):
+            async with self._lock:
+                conv = self._conversations.pop(key, None)
+        if conv and conv.account_token and conv.deepseek_session_id:
+            client = self._clients.get(conv.account_token)
             if client:
                 await client.delete_session(conv.deepseek_session_id)
 
     async def _sweep_loop(self) -> None:
         while True:
-            await asyncio.sleep(SWEEP_INTERVAL)
-            now = time.monotonic()
-            stale = [k for k, v in self._conversations.items() if now - v.last_used_at > SESSION_TTL]
-            for k in stale:
-                await self.reset(k)
+            try:
+                await asyncio.sleep(SWEEP_INTERVAL)
+                now = time.monotonic()
+                async with self._lock:
+                    stale = [
+                        k
+                        for k, v in self._conversations.items()
+                        if now - v.last_used_at > SESSION_TTL
+                    ]
+                for k in stale:
+                    await self.reset(k)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # sweeper must never die; retry next interval
+                continue
 
 
 def new_conversation_key() -> str:

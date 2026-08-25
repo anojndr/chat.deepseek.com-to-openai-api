@@ -29,7 +29,10 @@ class Account:
 
     def mark_failure(self, cooldown: float) -> None:
         self.failures += 1
-        self.disabled_until = time.monotonic() + min(cooldown * 2 ** (self.failures - 1), 900.0)
+        # cap reached at failures == 6; clamp the exponent so 2**(n-1) can
+        # never overflow float conversion during prolonged outages
+        shift = min(self.failures - 1, 5)
+        self.disabled_until = time.monotonic() + min(cooldown * (2**shift), 900.0)
 
     def mark_success(self) -> None:
         self.failures = 0
@@ -107,22 +110,38 @@ class AccountPool:
             best = min(pool, key=lambda a: a.disabled_until)
             return best
 
-    def mark_success(self, account: Account) -> None:
-        account.mark_success()
+    def by_token(self, token: str | None) -> Account | None:
+        """Resolve an account by its token (stable across reloads)."""
+        if token is None:
+            return None
+        with self._lock:
+            for a in self._accounts:
+                if a.token == token:
+                    return a
+        return None
 
-    def mark_failure(self, account: Account) -> None:
-        account.mark_failure(self._failure_cooldown)
-    def mark_success_by_index(self, index: int | None) -> None:
-        if index is not None and 0 <= index < len(self._accounts):
-            self._accounts[index].mark_success()
+    def mark_success(self, token: str) -> None:
+        with self._lock:
+            for a in self._accounts:
+                if a.token == token:
+                    a.mark_success()
+                    return
 
-    def mark_failure_by_index(self, index: int | None) -> None:
-        if index is not None and 0 <= index < len(self._accounts):
-            self._accounts[index].mark_failure(self._failure_cooldown)
+    def mark_failure(self, token: str) -> None:
+        with self._lock:
+            for a in self._accounts:
+                if a.token == token:
+                    a.mark_failure(self._failure_cooldown)
+                    return
 
     @property
     def size(self) -> int:
-        return len(self._accounts)
+        with self._lock:
+            return len(self._accounts)
+
+    def tokens(self) -> list[str]:
+        with self._lock:
+            return [a.token for a in self._accounts]
 
     def snapshot(self) -> list[dict]:
         now = time.monotonic()

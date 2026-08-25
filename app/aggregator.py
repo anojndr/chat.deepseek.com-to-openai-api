@@ -16,6 +16,7 @@ The aggregator tracks the current fragment (THINK vs RESPONSE) and emits:
 from __future__ import annotations
 
 from collections.abc import Iterator
+import re
 from typing import Any
 
 
@@ -43,18 +44,26 @@ class FragmentAggregator:
             return
 
         if "p" not in data and isinstance(data.get("v"), dict):
-            # initial snapshot
+            # initial snapshot — emit every fragment's content in stream order
             response = data["v"].get("response") or {}
             self.fragments = list(response.get("fragments") or [])
-            if self.fragments:
-                self.current = len(self.fragments) - 1
-                frag = self.fragments[self.current]
-                kind = self._kind(frag)
+            for idx, frag in enumerate(self.fragments):
+                ftype = frag.get("type")
                 content = frag.get("content")
                 if content:
-                    yield kind, content
-                if frag.get("type") == "TOOL_SEARCH" and frag.get("queries"):
-                    yield "search", frag.get("queries")
+                    yield self._kind(frag), str(content)
+                queries = frag.get("queries")
+                if isinstance(queries, list) and queries:
+                    yield "search", [
+                        q.get("query") if isinstance(q, dict) else str(q)
+                        for q in queries
+                        if (q.get("query") if isinstance(q, dict) else q)
+                    ]
+                if self._is_content_frag(frag) or ftype == "THINK":
+                    self.current = idx
+                elif ftype in ("TOOL_SEARCH", "SEARCH"):
+                    # search fragment: implicit appends must buffer, not attach
+                    self.current = -1
             return
 
         if "p" in data:
@@ -108,11 +117,7 @@ class FragmentAggregator:
             for sub in value or []:
                 if isinstance(sub, dict):
                     sub = {"o": sub.get("o", "SET"), **sub}
-                    yield from (
-                        item
-                        for item in self._apply_patch(sub)
-                        if item[0] != "search"
-                    )
+                    yield from self._apply_patch(sub)
             return
 
         if path in ("response/fragments", "fragments"):
@@ -122,41 +127,62 @@ class FragmentAggregator:
                     if not isinstance(frag, dict):
                         continue
                     self.fragments.append(frag)
-                    if frag.get("type") == "TOOL_SEARCH":
-                        if frag.get("queries"):
+                    if frag.get("type") in ("TOOL_SEARCH", "SEARCH"):
+                        # search fragments never receive implicit appends;
+                        # park current so implicit text buffers until the
+                        # RESPONSE/THINK fragment shows up
+                        self.current = -1
+                        queries = frag.get("queries")
+                        if isinstance(queries, list) and queries:
                             yield "search", [
-                                q.get("query") for q in frag["queries"] if q.get("query")
+                                q.get("query") if isinstance(q, dict) else str(q)
+                                for q in queries
+                                if (q.get("query") if isinstance(q, dict) else q)
                             ]
-                        continue  # search fragment: never the append target
+                        continue
                     if self._is_content_frag(frag) or frag.get("type") == "THINK":
                         self.current = len(self.fragments) - 1
-                        if self._pending:
-                            for piece in self._pending:
-                                frag["content"] = (frag.get("content") or "") + piece
-                                yield self._kind(frag), piece
-                            self._pending = []
-                        elif frag.get("content"):
-                            # fragment arrives already carrying text (e.g. the
-                            # final RESPONSE append) — emit it
-                            yield self._kind(frag), str(frag["content"])
+                        # implicit deltas buffered while this fragment was
+                        # pending arrived BEFORE the append, so stream them
+                        # first; the fragment's own initial content follows.
+                        prelude, self._pending = self._pending, []
+                        for piece in prelude:
+                            yield self._kind(frag), piece
+                        initial = str(frag.get("content") or "")
+                        full = "".join(prelude) + initial
+                        if full:
+                            frag["content"] = full
+                            if initial:
+                                yield self._kind(frag), initial
+
                 return
             if op == "DELETE":
                 self.fragments = []
                 self.current = -1
+                self._pending.clear()
                 return
 
-        if path.startswith("response/fragments/"):
+        sub = re.match(r"^(?:response/)?fragments/(.+)$", path)
+        if sub and not path.endswith("/fragments"):
             frag = self._frag_at(path)
-            tail = path.split("/")[-1]
-            if frag is not None and tail != "-1":
-                if op == "SET":
-                    frag[tail] = value
-                    if tail == "content":
-                        yield self._kind(frag), None  # marker; consumers ignore
-                elif op == "APPEND":
-                    frag[tail] = (frag.get(tail) or "") + str(value)
-                    yield self._kind(frag), str(value)
+            parts_after = sub.group(1).split("/")
+            tail = parts_after[-1]
+            if frag is None or tail == "-1":
                 return
+            if op == "SET":
+                frag[tail] = value
+                if tail == "content" and isinstance(value, str) and value:
+                    yield self._kind(frag), value
+            elif op == "APPEND":
+                if tail != "content":
+                    # results/references etc.: update state only — stringified
+                    # metadata must never leak out as answer text
+                    frag[tail] = value
+                    return
+                appended = str(value)
+                frag[tail] = (frag.get(tail) or "") + appended
+                yield self._kind(frag), appended
+            return
 
         if path == "response/status" or path == "response/quasi_status":
             return

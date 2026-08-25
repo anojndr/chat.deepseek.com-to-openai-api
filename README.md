@@ -27,12 +27,30 @@ curl http://127.0.0.1:34868/v1/chat/completions \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+## Configuration & security
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `HOST` | `127.0.0.1` | Bind address. The proxy holds your DeepSeek session tokens — only bind to a public interface if you know what you're doing. |
+| `PORT` | `34868` | Listen port |
+| `API_KEY` | unset | When set, all generation/admin routes require `Authorization: Bearer <key>` (or `x-api-key`). `/health` and `/v1/models` stay open. |
+
+## Disclaimer
+
+This tool drives **chat.deepseek.com** browserlessly using session tokens
+extracted from a logged-in browser and replicates its internal
+proof-of-work protocol. This is an unofficial client: it likely violates
+DeepSeek's Terms of Service, may break when their web client changes, and
+can get your accounts suspended or banned. Use at your own risk with
+accounts you are willing to lose.
+
 ## Endpoints
 
 | Endpoint | Notes |
 |---|---|
 | `POST /v1/chat/completions` | Full Chat Completions contract, streaming + non-streaming |
 | `POST /v1/responses` | Responses API: string or item-list `input`, `instructions`, `previous_response_id`, typed SSE events |
+| `GET /v1/responses/{response_id}` | Retrieve a stored response (LRU-bounded, in-process) |
 | `GET /v1/models` | Model list |
 | `GET /health` | Account pool status |
 | `POST /accounts/reload` | Re-read `accounts.txt` without restart (add accounts live) |
@@ -42,7 +60,8 @@ curl http://127.0.0.1:34868/v1/chat/completions \
 
 - `deepseek-chat` — default (Instant)
 - `deepseek-chat-deepthink` — thinking enabled
-- `deepseek-reasoner[-deepthink]` — aliases
+- `deepseek-reasoner` — alias; thinks by default (`deepseek-r1` too)
+- any model id also accepts `-think`/`-thinking` as the thinking suffix
 - `vision[-deepthink]` — DeepSeek Vision; forces `model_type:"vision"` even without attachments
 
 Any model id ending in `-deepthink` (or `-think`) enables DeepSeek's thinking
