@@ -16,8 +16,6 @@ import re
 
 _CITE = re.compile(r"\[citation:(\d+)\]")
 _ADJACENT = re.compile(r"(\[citation:\d+\])(?=\[citation:)")
-# any strict prefix of "[citation:" plus optional digits — held back until complete
-_PARTIAL = re.compile(r"\[(?:c(?:i(?:t(?:a(?:t(?:i(?:o(?:n)?)?|on)?|io)?|at)?|ta)?|it)?|cita)?(?:tion)?:?\d{0,6}$", re.IGNORECASE)
 _HEAD = "[citation:]"
 
 
@@ -67,7 +65,7 @@ class CitationRewriter:
             self._pending = out[-hold:]
             out = out[: -hold]
         if out:
-            self._ended_with_cite = bool(re.search(r"(\[citation:\d+\](?:\([^)]*\))?)$", out))
+            self._ended_with_cite = bool(re.search(r"(\[citation:\d+\](?:\(\S*\))?)$", out))
         return out
 
     def finish(self) -> str:

@@ -288,6 +288,7 @@ class ConversationManager:
             buffer_reasoning: list[str] = []
             searches: list[Any] = []
             reference_urls: list[str | None] = []
+            rewriter = CitationRewriter(reference_urls)
             emitted = False
             effective_model = model_type or ("vision" if file_ids else None)
             try:
@@ -302,10 +303,11 @@ class ConversationManager:
                     if ev.kind == "references":
                         reference_urls.extend(ev.value if isinstance(ev.value, list) else [])
                     elif ev.kind == "content":
-                        # Hold content until the stream finishes: DeepSeek can
-                        # send result URLs after the cited text, so rewriting
-                        # each delta immediately would leak bare markers.
-                        buffer_content.append(str(ev.value))
+                        chunk = rewriter.feed(str(ev.value))
+                        if chunk:
+                            buffer_content.append(chunk)
+                            emitted = True
+                            yield StreamEvent("content", chunk)
                     elif ev.kind == "reasoning":
                         buffer_reasoning.append(str(ev.value))
                         emitted = True
@@ -316,11 +318,12 @@ class ConversationManager:
                         if isinstance(ev.value, list):
                             searches.extend(ev.value)
                         emitted = True
-                raw_text = "".join(buffer_content)
-                text = rewrite_citations(raw_text, reference_urls)
-                if text:
+                final_chunk = rewriter.finish()
+                if final_chunk:
+                    buffer_content.append(final_chunk)
                     emitted = True
-                    yield StreamEvent("content", text)
+                    yield StreamEvent("content", final_chunk)
+                text = "".join(buffer_content)
                 reasoning = "".join(buffer_reasoning)
                 if not text:
                     # No RESPONSE fragment (refusal / answer stuck in THINK /

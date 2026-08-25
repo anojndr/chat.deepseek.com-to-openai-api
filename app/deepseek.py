@@ -193,8 +193,8 @@ class DeepSeekClient:
             # that is expected — the vision fork below re-parses it. Wait for
             # the parse to reach a TERMINAL state before forking.
             st = await wait_terminal(file_id, 30.0)
-            if st in ("ERROR", "REJECTED"):
-                raise DeepSeekError(f"initial upload parse failed ({st})")
+            if st not in ("SUCCESS", "CONTENT_EMPTY"):
+                raise DeepSeekError(f"initial upload parse failed ({st or 'timed out'})")
 
         if vision:
             payload = await self._request_json(
