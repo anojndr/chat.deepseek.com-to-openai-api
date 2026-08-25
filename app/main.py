@@ -174,9 +174,14 @@ async def list_models() -> dict:
             "created": now,
             "owned_by": "deepseek-proxy",
         },
-        {"id": "vision", "object": "model", "created": now, "owned_by": "deepseek-proxy"},
         {
-            "id": "vision-deepthink",
+            "id": "deepseek-vision",
+            "object": "model",
+            "created": now,
+            "owned_by": "deepseek-proxy",
+        },
+        {
+            "id": "deepseek-vision-deepthink",
             "object": "model",
             "created": now,
             "owned_by": "deepseek-proxy",

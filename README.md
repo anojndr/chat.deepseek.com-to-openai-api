@@ -62,7 +62,7 @@ accounts you are willing to lose.
 - `deepseek-chat-deepthink` — thinking enabled
 - `deepseek-reasoner` — alias; thinks by default (`deepseek-r1` too)
 - any model id also accepts `-think`/`-thinking` as the thinking suffix
-- `vision[-deepthink]` — DeepSeek Vision; forces `model_type:"vision"` even without attachments
+- `deepseek-vision[-deepthink]` — DeepSeek Vision; forces `model_type:"vision"` even without attachments (plain `vision` still works as a legacy alias)
 
 Any model id ending in `-deepthink` (or `-think`) enables DeepSeek's thinking
 mode; reasoning streams as `reasoning_content` deltas (Chat) /

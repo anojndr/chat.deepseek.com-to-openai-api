@@ -19,7 +19,8 @@ MODEL_ALIASES = {
     "deepseek-r1": None,
     "default": None,
     "expert": "expert",
-    "vision": "vision",
+    "deepseek-vision": "vision",
+    "vision": "vision",  # legacy alias for deepseek-vision
 }
 
 
