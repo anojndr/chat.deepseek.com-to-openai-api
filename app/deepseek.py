@@ -168,21 +168,33 @@ class DeepSeekClient:
         biz = self._check_biz(resp.json(), "upload_file")
         file_id = self._require(biz, "id", "upload_file")
 
-        async def wait_success(fid: str, seconds: float) -> bool:
+        terminal = ("SUCCESS", "CONTENT_EMPTY", "ERROR", "REJECTED")
+
+        async def wait_terminal(fid: str, seconds: float) -> str | None:
+            """Wait until the file leaves PENDING/PARSING; return last status."""
             deadline = time.monotonic() + seconds
+            status: str | None = None
             while time.monotonic() < deadline:
                 status = await self._fetch_file_status(fid)
-                if status == "SUCCESS":
-                    return True
-                if status in ("ERROR", "CONTENT_EMPTY", "REJECTED"):
-                    raise DeepSeekError(
-                        f"upload processing failed for {fid} (status={status})"
-                    )
+                if status in terminal:
+                    return status
                 await asyncio.sleep(0.4)
-            return False
+            return status  # None or still-parsing
 
-        if vision and not await wait_success(file_id, 20.0):
-            raise DeepSeekError(f"timed out waiting for initial parse of {file_id}")
+        async def wait_success(fid: str, seconds: float) -> None:
+            status = await wait_terminal(fid, seconds)
+            if status != "SUCCESS":
+                raise DeepSeekError(
+                    f"upload processing failed for {fid} (status={status})"
+                )
+
+        if vision:
+            # default-model parse of an image ends CONTENT_EMPTY (no text);
+            # that is expected — the vision fork below re-parses it. Wait for
+            # the parse to reach a TERMINAL state before forking.
+            st = await wait_terminal(file_id, 30.0)
+            if st in ("ERROR", "REJECTED"):
+                raise DeepSeekError(f"initial upload parse failed ({st})")
 
         if vision:
             payload = await self._request_json(
@@ -198,12 +210,14 @@ class DeepSeekClient:
             if not new_id:
                 raise DeepSeekError("fork_file_task response missing new file id")
             file_id = str(new_id)
+            # non-vision images are useless without text extraction
+        elif not vision and mime and mime.startswith("image/"):
+            pass  # handled by generic wait below
 
-        if not await wait_success(file_id, 30.0):
-            status = await self._fetch_file_status(file_id)
-            raise DeepSeekError(
-                f"upload processing timed out for {file_id} (last status={status})"
-            )
+        if vision:
+            await wait_success(file_id, 40.0)
+        else:
+            await wait_success(file_id, 30.0)
         return file_id
 
     async def stream_completion(
