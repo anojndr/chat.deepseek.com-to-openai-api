@@ -282,11 +282,15 @@ class ConversationManager:
                 self._pool.mark_success(account.token)
                 return result
             except asyncio.CancelledError:
+                conv.deepseek_session_id = None
+                conv.parent_message_id = None
+                self._persist_conversation(conv)
                 raise
             except EmptyCompletion as exc:
                 last_error = exc
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
+                self._persist_conversation(conv)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -296,6 +300,7 @@ class ConversationManager:
                     self._pool.mark_failure(account_token)
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
+                self._persist_conversation(conv)
                 continue
         final = last_ds_error or DeepSeekError(f"all accounts failed for this turn: {last_error}")
         raise final
@@ -342,6 +347,12 @@ class ConversationManager:
                     turn_prepared = self._replay_prompt(conv, prepared)
                 file_ids = await self._upload_files(client, conv, turn_prepared)
             except asyncio.CancelledError:
+                # Cancel during session create / file upload: a freshly created
+                # but message-less session must not stay pinned, or the next
+                # turn skips replay and sends a bare prompt with zero context.
+                conv.deepseek_session_id = None
+                conv.parent_message_id = None
+                self._persist_conversation(conv)
                 raise
             except Exception as exc:  # muted/rate-limited/network -> rotate
                 last_error = exc
@@ -351,6 +362,7 @@ class ConversationManager:
                     self._pool.mark_failure(account_token)
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
+                self._persist_conversation(conv)
                 continue
 
             buffer_content: list[str] = []
@@ -405,11 +417,19 @@ class ConversationManager:
                 self._pool.mark_success(account_token or "")
                 return
             except asyncio.CancelledError:
+                # Client vanished mid-stream: upstream may have committed a
+                # half-recorded turn. Drop the pinned session so the next turn
+                # replays full history into a fresh one instead of appending at
+                # a stale parent.
+                conv.deepseek_session_id = None
+                conv.parent_message_id = None
+                self._persist_conversation(conv)
                 raise
             except EmptyCompletion as exc:
                 last_error = exc
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
+                self._persist_conversation(conv)
                 continue
             except Exception as exc:
                 last_error = exc
@@ -419,6 +439,7 @@ class ConversationManager:
                     self._pool.mark_failure(account_token)
                 conv.deepseek_session_id = None
                 conv.parent_message_id = None
+                self._persist_conversation(conv)
                 if emitted:
                     # mid-stream failure after content was streamed: surface
                     raise DeepSeekError(
@@ -493,8 +514,12 @@ class ConversationManager:
         ):
             if event.get("event") == "ready":
                 rid = (event.get("data") or {}).get("response_message_id")
-                if isinstance(rid, int):
+                # Record + persist the moment DeepSeek commits the message slot:
+                # a later crash/cancel must never leave parent_message_id behind
+                # the session head, or the next turn appends at a stale ancestor.
+                if isinstance(rid, int) and rid != conv.parent_message_id:
                     conv.parent_message_id = rid
+                    self._persist_conversation(conv)
             for kind, value in agg.apply(event.get("event"), event.get("data")):
                 if kind == "meta" and isinstance(value, dict) and value.get("title"):
                     title = str(value["title"])
@@ -524,7 +549,6 @@ class ConversationManager:
         model_type: str | None,
     ) -> AsyncIterator[StreamEvent]:
         agg = FragmentAggregator()
-        response_id: int | None = None
         announced_refs = 0
         async for event in client.stream_completion(
             prompt=prompt,
@@ -538,8 +562,13 @@ class ConversationManager:
             if event.get("event") == "ready":
                 data = event.get("data") or {}
                 rid = data.get("response_message_id")
-                if isinstance(rid, int):
-                    response_id = rid
+                # Persist immediately: waiting until stream end leaves a stale
+                # parent_message_id whenever the stream dies or the client
+                # disconnects mid-answer; the next turn then branches off an
+                # ancestor message and DeepSeek answers the previous topic.
+                if isinstance(rid, int) and rid != conv.parent_message_id:
+                    conv.parent_message_id = rid
+                    self._persist_conversation(conv)
                 continue
             emitted_from_patch = False
             for kind, value in agg.apply(event.get("event"), event.get("data")):
@@ -553,9 +582,6 @@ class ConversationManager:
                 new_refs = agg.reference_urls[announced_refs:]
                 announced_refs = len(agg.reference_urls)
                 yield StreamEvent("references", new_refs)
-        if response_id is not None:
-            conv.parent_message_id = response_id
-            self._persist_conversation(conv)
 
     def _record_history(self, conv: Conversation, prompt: str, answer: str) -> None:
         conv.history.append({"role": "user", "content": prompt})
