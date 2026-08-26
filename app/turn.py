@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,6 +95,69 @@ def ensure_extension(filename: str, mime: str | None) -> str:
         return filename
     ext = _MIME_EXT.get(mime or "", "bin")
     return f"{filename}.{ext}"
+
+def item_hash(prev: str, role: str, canon: str) -> str:
+    h = hashlib.sha256()
+    h.update(prev.encode())
+    h.update(f"|{role}|".encode())
+    h.update(canon.encode())
+    return h.hexdigest()[:32]
+
+
+def compute_history_hashes(
+    messages: list[dict[str, Any]],
+    instructions: str | None = None,
+) -> tuple[list[str], str]:
+    """Compute prefix rolling hashes for a message history.
+
+    Returns (hashes, system_text).
+    """
+    system_chunks: list[str] = []
+    if instructions:
+        system_chunks.append(instructions)
+
+    items: list[tuple[str, str]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role in ("system", "developer"):
+            role_name = "system"
+        elif role == "assistant":
+            role_name = "assistant"
+        elif role == "tool":
+            role_name = "tool"
+        else:
+            role_name = "user"
+
+        text, files = _flatten_content(msg.get("content"))
+        if msg.get("tool_calls"):
+            calls = ", ".join(
+                (c.get("function") or {}).get("name", "?") for c in msg["tool_calls"]
+            )
+            text = (text + f"\n[called tools: {calls}]").strip()
+        if msg.get("tool_call_id"):
+            text = f"[result for {msg['tool_call_id']}] {text}".strip()
+
+        if role_name == "system":
+            system_chunks.append(text)
+        else:
+            canon = text
+            if files:
+                extras: list[str] = []
+                for f in files:
+                    f_kind = f.get("kind", "")
+                    f_name = f.get("filename", "")
+                    f_data = str(f.get("file_data") or f.get("url") or "")
+                    extras.append(f"{f_kind}:{f_name}:{len(f_data)}")
+                canon = canon + "\x00" + "\x00".join(extras)
+            items.append((role_name, canon))
+
+    system_text = "\n\n".join(s for s in system_chunks if s)
+    prev = item_hash("", "system", system_text) if system_text else ""
+    hashes: list[str] = []
+    for role_name, canon in items:
+        prev = item_hash(prev, role_name, canon)
+        hashes.append(prev)
+    return hashes, system_text
 
 
 def prepare_turn(

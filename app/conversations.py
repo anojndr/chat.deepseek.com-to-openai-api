@@ -21,8 +21,8 @@ from .aggregator import FragmentAggregator
 from .citations import CitationRewriter, rewrite_citations
 from .deepseek import DeepSeekClient, DeepSeekError
 from .pow_solver import PowSolver
-from .storage import Storage
-from .turn import PreparedTurn
+from .storage import Storage, ConvRef
+from .turn import PreparedTurn, item_hash
 
 
 @dataclass
@@ -230,9 +230,10 @@ class ConversationManager:
         deepthink: bool,
         model_type: str | None,
         max_retries: int | None = None,
+        hashes: list[str] | None = None,
     ) -> TurnResult:
         async with self.key_lock(key):
-            return await self._run_turn_locked(key, prepared, deepthink=deepthink, model_type=model_type, max_retries=max_retries)
+            return await self._run_turn_locked(key, prepared, deepthink=deepthink, model_type=model_type, max_retries=max_retries, hashes=hashes)
 
     async def _run_turn_locked(
         self,
@@ -242,6 +243,7 @@ class ConversationManager:
         deepthink: bool,
         model_type: str | None,
         max_retries: int | None = None,
+        hashes: list[str] | None = None,
     ) -> TurnResult:
         conv = await self.get_or_create(key)
         attempts = max_retries or self._pool.size or 1
@@ -279,6 +281,18 @@ class ConversationManager:
                     # account is broken.
                     raise EmptyCompletion("empty completion from upstream")
                 self._record_history(conv, turn_prepared.prompt, result.content)
+                if hashes and self._storage is not None and conv.deepseek_session_id:
+                    assistant_hash = item_hash(hashes[-1], "assistant", result.content)
+                    ref = ConvRef(
+                        conversation_key=conv.id,
+                        account_index=conv.account_index,
+                        account_token=conv.account_token or "",
+                        deepseek_session_id=conv.deepseek_session_id,
+                        parent_message_id=conv.parent_message_id,
+                        turns=len(hashes),
+                        updated_at=time.time(),
+                    )
+                    self._storage.record_prefix_turn([assistant_hash], ref)
                 self._pool.mark_success(account.token)
                 return result
             except asyncio.CancelledError:
@@ -312,12 +326,13 @@ class ConversationManager:
         *,
         deepthink: bool,
         model_type: str | None,
+        hashes: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Streaming variant; yields deltas as they arrive from DeepSeek."""
         async with self.key_lock(key):
             conv = await self.get_or_create(key)
             async for ev in self._stream_turn_locked(
-                key, conv, prepared, deepthink=deepthink, model_type=model_type
+                key, conv, prepared, deepthink=deepthink, model_type=model_type, hashes=hashes
             ):
                 yield ev
 
@@ -329,6 +344,7 @@ class ConversationManager:
         *,
         deepthink: bool,
         model_type: str | None,
+        hashes: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         attempts = max(self._pool.size, 1)
         last_error: Exception | None = None
@@ -414,6 +430,18 @@ class ConversationManager:
                 if searches:
                     yield StreamEvent("search", searches)
                 self._record_history(conv, turn_prepared.prompt, text)
+                if hashes and self._storage is not None and conv.deepseek_session_id:
+                    assistant_hash = item_hash(hashes[-1], "assistant", text)
+                    ref = ConvRef(
+                        conversation_key=conv.id,
+                        account_index=conv.account_index,
+                        account_token=conv.account_token or "",
+                        deepseek_session_id=conv.deepseek_session_id,
+                        parent_message_id=conv.parent_message_id,
+                        turns=len(hashes),
+                        updated_at=time.time(),
+                    )
+                    self._storage.record_prefix_turn([assistant_hash], ref)
                 self._pool.mark_success(account_token or "")
                 return
             except asyncio.CancelledError:

@@ -9,6 +9,8 @@ from test_turn_recovery import (
     test_cancelled_stream_drops_session,
     test_ready_persisted_before_stream_finishes,
 )
+from test_user_scenario import TestUserScenario
+from test_branching_and_isolation import TestBranchingAndIsolation
 
 
 class TestSQLitePersistence(unittest.TestCase):

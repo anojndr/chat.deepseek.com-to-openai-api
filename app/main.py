@@ -23,8 +23,8 @@ from .models import (
     parse_model,
 )
 from .pow_solver import PowSolver
-from .storage import Storage
-from .turn import prepare_turn
+from .storage import Storage, ConvRef
+from .turn import prepare_turn, compute_history_hashes
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_PATH = Path("/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt")
@@ -225,9 +225,43 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     key = _conversation_key(request, body.user)
 
     raw_messages = [m.model_dump(exclude_none=True) for m in body.messages]
-    # first turn = conversation has no pinned deepseek session yet
-    conv = await manager().get_or_create(key)
-    is_first = conv.deepseek_session_id is None
+    hashes, system_text = compute_history_hashes(raw_messages)
+
+    has_custom_session_header = bool(
+        request.headers.get("x-session-id") or request.headers.get("x-conversation-id")
+    )
+
+    if has_custom_session_header:
+        conv = await manager().get_or_create(key)
+        is_first = conv.deepseek_session_id is None
+    else:
+        # Match longest prefix
+        match = _storage.find_prefix(hashes) if _storage is not None else None
+        matched_len = match[0] if match else 0
+        ref: ConvRef | None = match[1] if match else None
+
+        if ref is not None and matched_len >= len(hashes):
+            # Exact duplicate request: re-match at matched_len - 1
+            matched_len = len(hashes) - 1
+            rematch = _storage.find_prefix(hashes[:matched_len]) if (matched_len > 0 and _storage is not None) else None
+            ref = rematch[1] if rematch else None
+
+        if ref is not None:
+            # Fork into a distinct conversation instance referencing the parent checkpoint
+            # Only continue incrementally if the prefix matches up to the immediate parent message
+            is_immediate_parent = (matched_len == len(hashes) - 1)
+            key = f"auto:{uuid.uuid4().hex}"
+            conv = await manager().get_or_create(key)
+            conv.account_index = ref.account_index
+            conv.account_token = ref.account_token
+            conv.deepseek_session_id = ref.deepseek_session_id
+            conv.parent_message_id = ref.parent_message_id
+            is_first = not is_immediate_parent
+        else:
+            # Brand new conversation
+            key = f"auto:{uuid.uuid4().hex}"
+            conv = await manager().get_or_create(key)
+            is_first = True
     prepared = prepare_turn(raw_messages, is_first_turn=is_first)
     if not prepared.prompt:
         return _error("no usable prompt in messages", 400, "invalid_request_error")
@@ -238,14 +272,14 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
 
     if body.stream:
         return StreamingResponse(
-            _chat_stream(key, prepared, spec, completion_id, created, model_id, body.include_usage),
+            _chat_stream(key, prepared, spec, completion_id, created, model_id, body.include_usage, hashes=hashes),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     try:
         result = await manager().run_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type
+            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
         )
     except DeepSeekError as exc:
         return _http_error(exc)
@@ -283,6 +317,7 @@ async def _chat_stream(
     created: int,
     model_id: str,
     include_usage: bool,
+    hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
     def chunk(delta: dict, finish: str | None = None) -> str:
         return _sse(
@@ -301,7 +336,7 @@ async def _chat_stream(
     completion_est = 0
     try:
         async for ev in manager().stream_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type
+            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
         ):
             if ev.kind == "reasoning":
                 yield chunk({"reasoning_content": str(ev.value)})
@@ -368,8 +403,38 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
     if body.instructions:
         items.insert(0, {"role": "system", "content": body.instructions})
 
-    conv = await manager().get_or_create(key)
-    is_first = conv.deepseek_session_id is None
+    hashes, system_text = compute_history_hashes(items, instructions=body.instructions)
+    has_custom_session_header = bool(
+        request.headers.get("x-session-id") or request.headers.get("x-conversation-id")
+    )
+    if body.previous_response_id or has_custom_session_header:
+        conv = await manager().get_or_create(key)
+        is_first = conv.deepseek_session_id is None
+    else:
+        # Match prefix
+        match = _storage.find_prefix(hashes) if _storage is not None else None
+        matched_len = match[0] if match else 0
+        ref: ConvRef | None = match[1] if match else None
+
+        if ref is not None and matched_len >= len(hashes):
+            matched_len = len(hashes) - 1
+            rematch = _storage.find_prefix(hashes[:matched_len]) if (matched_len > 0 and _storage is not None) else None
+            ref = rematch[1] if rematch else None
+
+        if ref is not None:
+            is_immediate_parent = (matched_len == len(hashes) - 1)
+            key = f"auto:{uuid.uuid4().hex}"
+            conv = await manager().get_or_create(key)
+            conv.account_index = ref.account_index
+            conv.account_token = ref.account_token
+            conv.deepseek_session_id = ref.deepseek_session_id
+            conv.parent_message_id = ref.parent_message_id
+            is_first = not is_immediate_parent
+        else:
+            key = f"auto:{uuid.uuid4().hex}"
+            conv = await manager().get_or_create(key)
+            is_first = True
+
     prepared = prepare_turn(items, is_first_turn=is_first)
     if not prepared.prompt:
         return _error("no usable input", 400, "invalid_request_error")
@@ -417,6 +482,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
                 created,
                 base_response,
                 body.previous_response_id,
+                hashes=hashes,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -424,7 +490,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
 
     try:
         result = await manager().run_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type
+            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
         )
     except DeepSeekError as exc:
         return _http_error(exc)
@@ -471,6 +537,7 @@ async def _responses_stream(
     created: int,
     base_response,
     previous_response_id: str | None,
+    hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
     def event(name: str, payload: dict) -> str:
         payload = {"type": name, **payload}
@@ -500,7 +567,7 @@ async def _responses_stream(
     reasoning_text: list[str] = []
     try:
         async for ev in manager().stream_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type
+            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
         ):
             if ev.kind == "reasoning":
                 reasoning_text.append(str(ev.value))

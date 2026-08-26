@@ -9,6 +9,18 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
+
+
+@dataclass
+class ConvRef:
+    conversation_key: str
+    account_index: int | None
+    account_token: str
+    deepseek_session_id: str
+    parent_message_id: int | None
+    turns: int
+    updated_at: float
 
 
 class Storage:
@@ -65,6 +77,46 @@ class Storage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_response_links_created
                 ON response_links(created_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prefixes (
+                    hash TEXT PRIMARY KEY,
+                    conversation_key TEXT,
+                    account_index INTEGER,
+                    account_token TEXT NOT NULL,
+                    deepseek_session_id TEXT NOT NULL,
+                    parent_message_id INTEGER,
+                    turns INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_prefixes_updated
+                ON prefixes(updated_at)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS response_snapshots (
+                    response_id TEXT PRIMARY KEY,
+                    account_index INTEGER,
+                    account_token TEXT NOT NULL,
+                    deepseek_session_id TEXT NOT NULL,
+                    parent_message_id INTEGER,
+                    model TEXT NOT NULL,
+                    created REAL NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_response_snapshots_created
+                ON response_snapshots(created)
                 """
             )
 
@@ -166,6 +218,80 @@ class Storage:
         cur = conn.cursor()
         cur.execute("DELETE FROM conversations WHERE key = ?", (key,))
         return cur.rowcount > 0
+    # -----------------------------------------------------------------------
+    # Prefixes (multi-turn prefix matching)
+    # -----------------------------------------------------------------------
+
+    def find_prefix(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
+        """Longest prefix match. Returns (matched_len, ref)."""
+        if not hashes:
+            return None
+        conn = self._get_conn()
+        for k in range(len(hashes), 0, -1):
+            cur = conn.execute(
+                """
+                SELECT conversation_key, account_index, account_token,
+                       deepseek_session_id, parent_message_id, turns, updated_at
+                FROM prefixes
+                WHERE hash = ?
+                """,
+                (hashes[k - 1],),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                ref = ConvRef(
+                    conversation_key=row["conversation_key"],
+                    account_index=row["account_index"],
+                    account_token=row["account_token"],
+                    deepseek_session_id=row["deepseek_session_id"],
+                    parent_message_id=row["parent_message_id"],
+                    turns=row["turns"],
+                    updated_at=row["updated_at"],
+                )
+                return (k, ref)
+        return None
+
+    def record_prefix_turn(self, hashes: list[str], ref: ConvRef) -> None:
+        """Store hash chain entries for turn prefix hashes."""
+        if not hashes:
+            return
+        now = time.time()
+        ref.updated_at = now
+        conn = self._get_conn()
+        for h in hashes:
+            conn.execute(
+                """
+                INSERT INTO prefixes (
+                    hash, conversation_key, account_index, account_token,
+                    deepseek_session_id, parent_message_id, turns, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(hash) DO UPDATE SET
+                    conversation_key = excluded.conversation_key,
+                    account_index = excluded.account_index,
+                    account_token = excluded.account_token,
+                    deepseek_session_id = excluded.deepseek_session_id,
+                    parent_message_id = excluded.parent_message_id,
+                    turns = excluded.turns,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    h,
+                    ref.conversation_key,
+                    ref.account_index,
+                    ref.account_token,
+                    ref.deepseek_session_id,
+                    ref.parent_message_id,
+                    ref.turns,
+                    ref.updated_at,
+                ),
+            )
+
+        # Prune old prefixes if table is large (> 20,000)
+        cur = conn.execute("SELECT COUNT(*) FROM prefixes")
+        count = cur.fetchone()[0]
+        if count > 20000:
+            cutoff = now - 24 * 3600.0  # 24 hour TTL
+            conn.execute("DELETE FROM prefixes WHERE updated_at < ?", (cutoff,))
 
     def delete_stale_conversations(self, max_idle_seconds: float) -> list[dict[str, Any]]:
         threshold = time.time() - max_idle_seconds
