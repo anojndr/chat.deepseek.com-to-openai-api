@@ -68,6 +68,42 @@ class FakeDeepSeekClient:
 
 
 class TestUserScenario(unittest.TestCase):
+    def test_space_before_punctuation_and_citations(self):
+        from app.citations import CitationRewriter, rewrite_citations
+
+        # 1. Non-streaming space-before-period fix
+        raw_text = (
+            "This girl is **Hina Yumihara** from the 2014 mecha anime **Buddy Complex** .\n\n"
+            "### 🎬 Series Details\n\n"
+            "*   **Character Role**: A transfer student who is secretly a time traveler and pilot from the future .\n"
+            "*   **Studio**: Sunrise .\n"
+            "*   **Plot Summary**: High school student Aoba Watase is thrust into a future war after being saved by Hina, and the series follows his journey piloting a giant robot ."
+        )
+        cleaned = rewrite_citations(raw_text, [])
+        self.assertNotIn(" .", cleaned)
+        self.assertIn("**Buddy Complex**.", cleaned)
+        self.assertIn("Sunrise.", cleaned)
+        self.assertIn("giant robot.", cleaned)
+
+        # 2. Vision [!citation:N] markers linking
+        raw_cite = "From the anime **Buddy Complex** [!citation:1][!citation:2]."
+        rewritten = rewrite_citations(raw_cite, ["https://example.com/1", "https://example.com/2"])
+        self.assertEqual(rewritten, "From the anime **Buddy Complex** [citation:1](https://example.com/1) [citation:2](https://example.com/2).")
+
+        # 3. Streaming chunk boundaries across space and period
+        rw = CitationRewriter([])
+        chunks = [
+            "This girl is **Hina Yumihara** from the 2014 mecha anime **Buddy Complex** ",
+            ".\n\n*   **Studio**: Sunrise ",
+            " .\n*   **Plot Summary**: High school student",
+            " ."
+        ]
+        streamed = "".join(rw.feed(c) for c in chunks) + rw.finish()
+        self.assertNotIn(" .", streamed)
+        self.assertIn("**Buddy Complex**.", streamed)
+        self.assertIn("Sunrise.", streamed)
+        self.assertIn("High school student.", streamed)
+
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmpdir.name) / "test_data.sqlite"

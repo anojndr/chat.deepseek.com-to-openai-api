@@ -14,23 +14,29 @@ from __future__ import annotations
 
 import re
 
-_CITE = re.compile(r"\[citation:(\d+)\]")
-_ADJACENT = re.compile(r"(\[citation:\d+\])(?=\[citation:)")
-_HEAD = "[citation:]"
+_CITE = re.compile(r"\[!?citation:(\d+)\]")
+_ADJACENT = re.compile(r"(\[!?[cC]itation:\d+\])(?=\[!?[cC]itation:)")
+_HEADS = ("[citation:", "[!citation:")
+
+
+def _fix_space_before_punct(text: str) -> str:
+    """Remove spaces before punctuation marks (periods, commas, etc.)."""
+    return re.sub(r" +([.,!?:;])(?=[\s\n\r]|$)", r"\1", text)
 
 
 def _holdback_len(text: str) -> int:
-    """Length of a trailing partial '[citation:…' marker, or 0."""
+    """Length of a trailing partial '[citation:…' or '[!citation:…' marker, or 0."""
     idx = text.rfind("[")
     if idx == -1:
         return 0
     suffix = text[idx:]
     if "]" in suffix:
         return 0
-    if len(suffix) > len(_HEAD) + 6:  # longest possible partial
+    if len(suffix) > 20:  # longest possible partial
         return 0
-    if _HEAD.startswith(suffix) or suffix.startswith("[citation:") and suffix[len("[citation:") :].isdigit():
-        return len(suffix)
+    for h in _HEADS:
+        if h.startswith(suffix) or (suffix.lower().startswith(h) and suffix[len(h) :].isdigit()):
+            return len(suffix)
     return 0
 
 
@@ -49,30 +55,37 @@ class CitationRewriter:
         if 1 <= n <= len(self._refs):
             url = self._refs[n - 1]
             if url:
-                return f"[{match.group(0)[1:-1]}]({url})"
+                return f"[citation:{n}]({url})"
         return match.group(0)
 
     def feed(self, text: str) -> str:
         buf = self._pending + text
         self._pending = ""
-        if self._ended_with_cite and buf.startswith("[citation:"):
+        if self._ended_with_cite and re.match(r"^\[!?citation:", buf, re.IGNORECASE):
             buf = " " + buf
             self._ended_with_cite = False
         buf = _ADJACENT.sub(r"\1 ", buf)
         out = _CITE.sub(self._replace, buf)
+        out = _fix_space_before_punct(out)
         hold = _holdback_len(out)
         if hold:
             self._pending = out[-hold:]
             out = out[: -hold]
+        space_hold = 0
+        while len(out) > space_hold and out[-1 - space_hold] == " ":
+            space_hold += 1
+        if space_hold > 0:
+            self._pending = out[-space_hold:] + self._pending
+            out = out[:-space_hold]
         if out:
-            self._ended_with_cite = bool(re.search(r"(\[citation:\d+\](?:\(\S*\))?)$", out))
+            self._ended_with_cite = bool(re.search(r"(\[!?citation:\d+\](?:\(\S*\))?)$", out))
         return out
 
     def finish(self) -> str:
         rest = self._pending
         self._pending = ""
         self._ended_with_cite = False
-        return rest
+        return _fix_space_before_punct(rest)
 
 
 def rewrite_citations(text: str, reference_urls: list[str | None]) -> str:
