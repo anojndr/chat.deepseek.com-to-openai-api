@@ -146,6 +146,7 @@ class ChatCompletionRequest(BaseModel):
     max_completion_tokens: int | None = None
     user: str | None = None
     metadata: dict[str, Any] | None = None
+    include_sources: bool | str | None = None
 
     model_config = {"extra": "ignore"}
 
@@ -170,5 +171,6 @@ class ResponsesRequest(BaseModel):
     top_p: float | None = None
     max_output_tokens: int | None = None
     metadata: dict[str, Any] | None = None
+    include_sources: bool | str | None = None
 
     model_config = {"extra": "ignore"}

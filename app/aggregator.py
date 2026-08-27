@@ -28,6 +28,8 @@ class FragmentAggregator:
         self._pending: list[str] = []
         # search-result URLs in arrival order; citation N = reference_urls[N-1]
         self.reference_urls: list[str | None] = []
+        # structured search results in arrival order
+        self.search_results: list[dict[str, Any]] = []
 
     # -- public ------------------------------------------------------------
 
@@ -104,6 +106,8 @@ class FragmentAggregator:
         for item in value:
             url = item.get("url") if isinstance(item, dict) else None
             self.reference_urls.append(str(url) if url else None)
+            if isinstance(item, dict):
+                self.search_results.append(item)
 
     def _is_content_frag(self, frag: dict[str, Any]) -> bool:
         return frag.get("type", "") in ("", "RESPONSE")

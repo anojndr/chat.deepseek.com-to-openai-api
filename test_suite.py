@@ -11,6 +11,13 @@ from test_turn_recovery import (
 )
 from test_user_scenario import TestUserScenario
 from test_branching_and_isolation import TestBranchingAndIsolation
+from test_include_sources import (
+    SourceAppendixFormattingTest,
+    IncludeSourcesFlagTest,
+    ChatCompletionsAppendixEndpointTest,
+    ResponsesApiAppendixEndpointTest,
+    StreamEventsSourceEmissionTest,
+)
 
 
 class TestSQLitePersistence(unittest.TestCase):

@@ -43,6 +43,8 @@ class TurnResult:
     content: str
     reasoning: str | None
     title: str | None
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    search_queries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -385,6 +387,7 @@ class ConversationManager:
             buffer_reasoning: list[str] = []
             searches: list[Any] = []
             reference_urls: list[str | None] = []
+            sources_collected: list[dict[str, Any]] = []
             rewriter = CitationRewriter(reference_urls)
             emitted = False
             effective_model = model_type or ("vision" if file_ids else None)
@@ -409,6 +412,9 @@ class ConversationManager:
                         buffer_reasoning.append(str(ev.value))
                         emitted = True
                         yield ev
+                    elif ev.kind == "sources":
+                        if isinstance(ev.value, list):
+                            sources_collected = list(ev.value)
                     else:
                         # search/meta events are buffered so retries never
                         # duplicate output the client already received
@@ -429,6 +435,8 @@ class ConversationManager:
                     raise EmptyCompletion("completion returned no content")
                 if searches:
                     yield StreamEvent("search", searches)
+                if sources_collected:
+                    yield StreamEvent("sources", sources_collected)
                 self._record_history(conv, turn_prepared.prompt, text)
                 if hashes and self._storage is not None and conv.deepseek_session_id:
                     assistant_hash = item_hash(hashes[-1], "assistant", text)
@@ -501,23 +509,6 @@ class ConversationManager:
             )
         return ids
 
-    @staticmethod
-    def _body(
-        conv: Conversation,
-        prompt: str,
-        ref_file_ids: list[str],
-        thinking: bool,
-        model_type: str | None,
-    ) -> dict[str, Any]:
-        return {
-            "prompt": prompt,
-            "parent_message_id": conv.parent_message_id,
-            "ref_file_ids": ref_file_ids,
-            "thinking_enabled": thinking,
-            "search_enabled": True,  # always-on per requirements
-            "model_type": model_type,
-        }
-
     async def _collect(
         self,
         client: DeepSeekClient,
@@ -531,6 +522,7 @@ class ConversationManager:
     ) -> TurnResult:
         agg = FragmentAggregator()
         title: str | None = None
+        search_queries: list[str] = []
         async for event in client.stream_completion(
             prompt=prompt,
             chat_session_id=conv.deepseek_session_id or "",
@@ -551,6 +543,8 @@ class ConversationManager:
             for kind, value in agg.apply(event.get("event"), event.get("data")):
                 if kind == "meta" and isinstance(value, dict) and value.get("title"):
                     title = str(value["title"])
+                elif kind == "search" and isinstance(value, list):
+                    search_queries.extend(str(q) for q in value if q)
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         for frag in agg.fragments:
@@ -564,6 +558,8 @@ class ConversationManager:
             content=content,
             reasoning="".join(reasoning_parts) or None,
             title=title,
+            sources=list(agg.search_results),
+            search_queries=search_queries,
         )
 
     async def _stream_events(
@@ -578,6 +574,7 @@ class ConversationManager:
     ) -> AsyncIterator[StreamEvent]:
         agg = FragmentAggregator()
         announced_refs = 0
+        announced_sources = 0
         async for event in client.stream_completion(
             prompt=prompt,
             chat_session_id=conv.deepseek_session_id or "",
@@ -610,6 +607,9 @@ class ConversationManager:
                 new_refs = agg.reference_urls[announced_refs:]
                 announced_refs = len(agg.reference_urls)
                 yield StreamEvent("references", new_refs)
+            if len(agg.search_results) > announced_sources:
+                announced_sources = len(agg.search_results)
+                yield StreamEvent("sources", list(agg.search_results))
 
     def _record_history(self, conv: Conversation, prompt: str, answer: str) -> None:
         conv.history.append({"role": "user", "content": prompt})

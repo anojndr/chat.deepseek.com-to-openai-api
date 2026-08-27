@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .accounts import AccountPool
 from .conversations import ConversationManager
 from .deepseek import DeepSeekError
+from .citations import source_appendix
 from .models import (
     MODEL_BASE,
     ChatCompletionRequest,
@@ -46,6 +47,19 @@ def manager() -> "ConversationManager":
 
 
 API_KEY: str | None = os.environ.get("API_KEY")
+_INCLUDE_SOURCES_RAW = os.environ.get("DEEPSEEK_INCLUDE_SOURCES")
+if _INCLUDE_SOURCES_RAW is None:
+    _INCLUDE_SOURCES_RAW = os.environ.get("INCLUDE_SOURCES", "0")
+INCLUDE_SOURCES: bool = _INCLUDE_SOURCES_RAW.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _include_sources(flag: Any) -> bool:
+    """Per-request override; falls back to the DEEPSEEK_INCLUDE_SOURCES config flag."""
+    if flag is None:
+        return INCLUDE_SOURCES
+    if isinstance(flag, str):
+        return flag.strip().lower() in ("1", "true", "yes", "on")
+    return bool(flag)
 
 
 class MissingApiKey(Exception):
@@ -269,10 +283,21 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
     created = int(time.time())
     model_id = spec.wire_id
+    req_include_sources = _include_sources(body.include_sources)
 
     if body.stream:
         return StreamingResponse(
-            _chat_stream(key, prepared, spec, completion_id, created, model_id, body.include_usage, hashes=hashes),
+            _chat_stream(
+                key,
+                prepared,
+                spec,
+                completion_id,
+                created,
+                model_id,
+                body.include_usage,
+                req_include_sources,
+                hashes=hashes,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -284,11 +309,17 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
     except DeepSeekError as exc:
         return _http_error(exc)
 
-    message: dict = {"role": "assistant", "content": result.content}
+    final_content = result.content
+    if req_include_sources and result.sources:
+        appendix_query = result.search_queries[0] if result.search_queries else prepared.prompt
+        appendix = source_appendix(result.sources, appendix_query)
+        final_content = final_content + appendix
+
+    message: dict = {"role": "assistant", "content": final_content}
     usage = {
         "prompt_tokens": _estimate(prepared.prompt),
-        "completion_tokens": _estimate(result.content),
-        "total_tokens": _estimate(prepared.prompt) + _estimate(result.content),
+        "completion_tokens": _estimate(final_content),
+        "total_tokens": _estimate(prepared.prompt) + _estimate(final_content),
     }
     return JSONResponse(
         {
@@ -317,6 +348,7 @@ async def _chat_stream(
     created: int,
     model_id: str,
     include_usage: bool,
+    include_sources: bool = False,
     hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
     def chunk(delta: dict, finish: str | None = None) -> str:
@@ -334,6 +366,8 @@ async def _chat_stream(
 
     yield chunk({"role": "assistant", "content": ""})
     completion_est = 0
+    search_queries: list[str] = []
+    sources: list[dict[str, Any]] = []
     try:
         async for ev in manager().stream_turn(
             key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
@@ -345,7 +379,17 @@ async def _chat_stream(
                 completion_est += _estimate(text)
                 yield chunk({"content": text})
             elif ev.kind == "search":
-                continue
+                if isinstance(ev.value, list):
+                    search_queries.extend(str(q) for q in ev.value if q)
+            elif ev.kind == "sources":
+                if isinstance(ev.value, list):
+                    sources = list(ev.value)
+        if include_sources and sources:
+            appendix_query = search_queries[0] if search_queries else prepared.prompt
+            appendix = source_appendix(sources, appendix_query)
+            if appendix:
+                completion_est += _estimate(appendix)
+                yield chunk({"content": appendix})
         prompt_est = _estimate(prepared.prompt)
         yield chunk({}, finish="stop")
         if include_usage:
@@ -441,6 +485,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
 
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
+    req_include_sources = _include_sources(body.include_sources)
 
     def base_response(status: str = "in_progress", output: list | None = None) -> dict:
         return {
@@ -482,6 +527,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
                 created,
                 base_response,
                 body.previous_response_id,
+                req_include_sources,
                 hashes=hashes,
             ),
             media_type="text/event-stream",
@@ -494,6 +540,12 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
         )
     except DeepSeekError as exc:
         return _http_error(exc)
+
+    final_content = result.content
+    if req_include_sources and result.sources:
+        appendix_query = result.search_queries[0] if result.search_queries else prepared.prompt
+        appendix = source_appendix(result.sources, appendix_query)
+        final_content = final_content + appendix
 
     output_items: list[dict] = []
     if result.reasoning:
@@ -511,7 +563,7 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
             "status": "completed",
             "role": "assistant",
             "content": [
-                {"type": "output_text", "text": result.content, "annotations": []}
+                {"type": "output_text", "text": final_content, "annotations": []}
             ],
         }
     )
@@ -520,9 +572,9 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
     final["usage"] = {
         "input_tokens": _estimate(prepared.prompt),
         "input_tokens_details": {"cached_tokens": 0},
-        "output_tokens": _estimate(result.content),
+        "output_tokens": _estimate(final_content),
         "output_tokens_details": {"reasoning_tokens": _estimate(result.reasoning or "")},
-        "total_tokens": _estimate(prepared.prompt) + _estimate(result.content),
+        "total_tokens": _estimate(prepared.prompt) + _estimate(final_content),
     }
     _store_response_link(response_id, key, spec.wire_id)
     return JSONResponse(final)
@@ -537,6 +589,7 @@ async def _responses_stream(
     created: int,
     base_response,
     previous_response_id: str | None,
+    include_sources: bool = False,
     hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
     def event(name: str, payload: dict) -> str:
@@ -565,6 +618,8 @@ async def _responses_stream(
 
     full_text: list[str] = []
     reasoning_text: list[str] = []
+    search_queries: list[str] = []
+    sources: list[dict[str, Any]] = []
     try:
         async for ev in manager().stream_turn(
             key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
@@ -584,6 +639,26 @@ async def _responses_stream(
                         "output_index": 0,
                         "content_index": 0,
                         "delta": str(ev.value),
+                    },
+                )
+            elif ev.kind == "search":
+                if isinstance(ev.value, list):
+                    search_queries.extend(str(q) for q in ev.value if q)
+            elif ev.kind == "sources":
+                if isinstance(ev.value, list):
+                    sources = list(ev.value)
+        if include_sources and sources:
+            appendix_query = search_queries[0] if search_queries else prepared.prompt
+            appendix = source_appendix(sources, appendix_query)
+            if appendix:
+                full_text.append(appendix)
+                yield event(
+                    "response.output_text.delta",
+                    {
+                        "item_id": msg_item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": appendix,
                     },
                 )
         text = "".join(full_text)

@@ -34,6 +34,7 @@ curl http://127.0.0.1:34868/v1/chat/completions \
 | `HOST` | `127.0.0.1` | Bind address. The proxy holds your DeepSeek session tokens — only bind to a public interface if you know what you're doing. |
 | `PORT` | `34868` | Listen port |
 | `API_KEY` | unset | When set, all generation/admin routes require `Authorization: Bearer <key>` (or `x-api-key`). `/health` and `/v1/models` stay open. |
+| `DEEPSEEK_INCLUDE_SOURCES` | `0` | Optional: append a "Sources" + "Search Queries" appendix to answers with web search results for llmcord-go's **Show Sources** button (`1`/`true`/`yes`/`on`); can also be set per request via `include_sources: true` (or `INCLUDE_SOURCES=1`). |
 
 ## Disclaimer
 
@@ -75,6 +76,12 @@ mode; reasoning streams as `reasoning_content` deltas (Chat) /
   links using the corresponding DeepSeek search-result URL, in both streaming and
   non-streaming responses. Adjacent markers get a space between them so links
   don't run together (`[citation:2](url) [citation:10](url)`).
+- **Sources appendix for llmcord-go**: To feed search citations into `llmcord-go`'s
+  **Show Sources** button, enable globally with `DEEPSEEK_INCLUDE_SOURCES=1` (or
+  `INCLUDE_SOURCES=1`) in your environment, or per request with `"include_sources": true`
+  in the JSON request body (e.g. `extra_body: {include_sources: true}` in `llmcord-go`).
+  When enabled, an appendix formatted as ``\n\nSources\n1. [Title](url) (domain) via `query`\n\nSearch Queries\n1. `query```
+  is appended after the answer text.
 - **Multi-turn**: pass a stable `X-Session-Id` header to pin one DeepSeek
   chat_session per conversation. Turn 1 sends the whole conversation; later
   turns send only the latest user message and continue via
