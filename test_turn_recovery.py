@@ -10,40 +10,109 @@ new prompt.
 
 import asyncio
 import tempfile
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, override
 
-from app.storage import Storage
 from app.accounts import AccountPool
 from app.conversations import ConversationManager, DeepSeekError
+from app.deepseek import DeepSeekClient
+from app.pow_solver import PowSolver
+from app.storage import Storage
 from app.turn import prepare_turn
 
 
-class FakeDeepSeekClient:
+class DummySolver(PowSolver):
+    """Test double that never touches wasm."""
+
+    def __init__(self) -> None:
+        pass
+
+    @override
+    def solve(
+        self,
+        challenge_hex: str,
+        salt: str,
+        expire_at: str | int | float,
+        difficulty: float | int,
+    ) -> int | None:
+        return None
+
+
+class FakeDeepSeekClient(DeepSeekClient):
     """Scriptable stand-in for DeepSeekClient."""
 
-    def __init__(self, token: str, script: list | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        script: list[dict[str, Any] | BaseException] | None = None,
+        pow_solver: PowSolver | None = None,
+        timeout: float = 120.0,
+    ) -> None:
         self.token = token
-        self.script: list[list] = [script] if script is not None else []
-        self.calls: list[dict] = []
+        self.script: list[list[dict[str, Any] | BaseException]] = (
+            [script] if script is not None else []
+        )
+        self.calls: list[dict[str, Any]] = []
         self.sessions: list[str] = []
 
+    @override
     async def create_session(self) -> str:
         sid = f"s{len(self.sessions) + 1}"
         self.sessions.append(sid)
         return sid
 
-    async def upload_file(self, *a, **k):  # pragma: no cover - unused here
+    @override
+    async def upload_file(
+        self,
+        filename: str,
+        content: bytes,
+        mime: str | None = None,
+        *,
+        vision: bool = False,
+    ) -> str:
         raise AssertionError("no files expected")
 
-    async def stream_completion(self, **kwargs):
-        self.calls.append(kwargs)
+    @override
+    async def stream_completion(
+        self,
+        *,
+        prompt: str,
+        chat_session_id: str,
+        parent_message_id: int | None = None,
+        ref_file_ids: list[str] | None = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = True,
+        model_type: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "chat_session_id": chat_session_id,
+                "parent_message_id": parent_message_id,
+                "ref_file_ids": ref_file_ids,
+                "thinking_enabled": thinking_enabled,
+                "search_enabled": search_enabled,
+                "model_type": model_type,
+            }
+        )
         for item in self.script.pop(0):
             if isinstance(item, BaseException):
                 raise item
             if isinstance(item, dict) and "__hang__" in item:
-                await item["__hang__"].wait()
+                hang = item["__hang__"]
+                assert isinstance(hang, asyncio.Event)
+                await hang.wait()
                 continue
             yield item
+
+    @override
+    async def aclose(self) -> None:
+        pass
+
+    @override
+    async def delete_session(self, session_id: str) -> None:
+        pass
 
 
 def _turn(rid: int, text: str):
@@ -52,7 +121,11 @@ def _turn(rid: int, text: str):
         {"event": "ready", "data": {"response_message_id": rid}},
         {
             "event": None,
-            "data": {"p": "response/fragments", "o": "APPEND", "v": {"type": "RESPONSE", "content": ""}},
+            "data": {
+                "p": "response/fragments",
+                "o": "APPEND",
+                "v": {"type": "RESPONSE", "content": ""},
+            },
         },
         {"event": None, "data": {"v": text}},
     ]
@@ -70,17 +143,16 @@ def _ready3_ok():
     return _turn(303, "a3")
 
 
-def _make_manager(tmpdir: str):
+def _make_manager(tmpdir: str) -> tuple[ConversationManager, FakeDeepSeekClient]:
     db_path = Path(tmpdir) / "t.sqlite"
     accounts_path = Path(tmpdir) / "accounts.txt"
     accounts_path.write_text('account 1\n{"userToken": "tok"}')
 
-    class DummySolver:
-        pass
-
-    mgr = ConversationManager(AccountPool(accounts_path), DummySolver(), storage=Storage(db_path))
+    mgr = ConversationManager(
+        AccountPool(accounts_path), DummySolver(), storage=Storage(db_path)
+    )
     client = FakeDeepSeekClient("tok")
-    mgr.client_for = lambda token: client  # type: ignore[method-assign]
+    mgr._clients["tok"] = client
     return mgr, client
 
 
@@ -94,7 +166,9 @@ async def test_midstream_failure_recovers_with_full_replay():
 
         # Turn 1: healthy - establishes session s1 + history.
         client.script.append(_ready_ok())
-        result = await mgr.run_turn("k", _prepared("q1"), deepthink=False, model_type=None)
+        result = await mgr.run_turn(
+            "k", _prepared("q1"), deepthink=False, model_type=None
+        )
         assert result.content == "a1"
         conv = await mgr.get_or_create("k")
         assert conv.deepseek_session_id == "s1"
@@ -134,7 +208,8 @@ async def test_midstream_failure_recovers_with_full_replay():
         await mgr.aclose()
 
 
-def storage_check(mgr: ConversationManager, key: str) -> dict:
+def storage_check(mgr: ConversationManager, key: str) -> dict[str, Any]:
+    assert mgr._storage is not None
     data = mgr._storage.get_conversation(key)
     assert data is not None
     return data
@@ -149,10 +224,12 @@ async def test_cancelled_stream_drops_session():
         assert (await mgr.get_or_create("k2")).deepseek_session_id == "s1"
 
         # Turn 2 hangs forever after the ready event (client disconnect shape).
-        client.script.append([
-            {"event": "ready", "data": {"response_message_id": 202}},
-            {"__hang__": asyncio.Event()},
-        ])
+        client.script.append(
+            [
+                {"event": "ready", "data": {"response_message_id": 202}},
+                {"__hang__": asyncio.Event()},
+            ]
+        )
 
         async def consume():
             async for _ev in mgr.stream_turn(
@@ -182,19 +259,38 @@ async def test_ready_persisted_before_stream_finishes():
         committed = asyncio.Event()
 
         class SlowClient(FakeDeepSeekClient):
-            async def stream_completion(self, **kwargs):
-                self.calls.append(kwargs)
+            @override
+            async def stream_completion(
+                self,
+                *,
+                prompt: str,
+                chat_session_id: str,
+                parent_message_id: int | None = None,
+                ref_file_ids: list[str] | None = None,
+                thinking_enabled: bool = False,
+                search_enabled: bool = True,
+                model_type: str | None = None,
+            ) -> AsyncIterator[dict[str, Any]]:
+                self.calls.append(
+                    {
+                        "prompt": prompt,
+                        "chat_session_id": chat_session_id,
+                        "parent_message_id": parent_message_id,
+                    }
+                )
                 yield {"event": "ready", "data": {"response_message_id": 555}}
                 committed.set()
                 await asyncio.sleep(0.4)
                 raise RuntimeError("boom")
 
         slow = SlowClient("tok")
-        mgr.client_for = lambda token: slow  # type: ignore[method-assign]
+        mgr._clients["tok"] = slow
 
         async def burn():
             try:
-                await mgr.run_turn("k3", _prepared("q"), deepthink=False, model_type=None)
+                await mgr.run_turn(
+                    "k3", _prepared("q"), deepthink=False, model_type=None
+                )
             except Exception:
                 pass
 

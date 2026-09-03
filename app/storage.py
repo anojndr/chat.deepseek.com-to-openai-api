@@ -1,5 +1,4 @@
-"""SQLite storage for conversations and response links to persist state across restarts.
-"""
+"""SQLite storage for conversations and response links to persist state across restarts."""
 
 from __future__ import annotations
 
@@ -32,19 +31,21 @@ class Storage:
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(
-                str(self.db_path),
-                timeout=30.0,
-                check_same_thread=False,
-                isolation_level=None,  # autocommit mode
-            )
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            self._local.conn = conn
-        return self._local.conn
+        conn_attr = getattr(self._local, "conn", None)
+        if isinstance(conn_attr, sqlite3.Connection):
+            return conn_attr
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30.0,
+            check_same_thread=False,
+            isolation_level=None,  # autocommit mode
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        self._local.conn = conn
+        return conn
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -218,6 +219,7 @@ class Storage:
         cur = conn.cursor()
         cur.execute("DELETE FROM conversations WHERE key = ?", (key,))
         return cur.rowcount > 0
+
     # -----------------------------------------------------------------------
     # Prefixes (multi-turn prefix matching)
     # -----------------------------------------------------------------------
@@ -293,7 +295,9 @@ class Storage:
             cutoff = now - 24 * 3600.0  # 24 hour TTL
             conn.execute("DELETE FROM prefixes WHERE updated_at < ?", (cutoff,))
 
-    def delete_stale_conversations(self, max_idle_seconds: float) -> list[dict[str, Any]]:
+    def delete_stale_conversations(
+        self, max_idle_seconds: float
+    ) -> list[dict[str, Any]]:
         threshold = time.time() - max_idle_seconds
         conn = self._get_conn()
         cur = conn.cursor()

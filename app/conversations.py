@@ -16,12 +16,12 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from .accounts import AccountPool
+from .accounts import Account, AccountPool
 from .aggregator import FragmentAggregator
 from .citations import CitationRewriter, rewrite_citations
 from .deepseek import DeepSeekClient, DeepSeekError
 from .pow_solver import PowSolver
-from .storage import Storage, ConvRef
+from .storage import ConvRef, Storage
 from .turn import PreparedTurn, item_hash
 
 
@@ -49,8 +49,8 @@ class TurnResult:
 
 @dataclass
 class StreamEvent:
-    kind: str  # 'reasoning' | 'content' | 'meta'
-    value: str | dict[str, Any]
+    kind: str  # 'reasoning' | 'content' | 'search' | 'sources' | 'references' | 'meta'
+    value: str | list[Any] | dict[str, Any]
 
 
 MAX_HISTORY_CHARS = 400_000
@@ -67,7 +67,9 @@ class EmptyCompletion(Exception):
 
 
 class ConversationManager:
-    def __init__(self, pool: AccountPool, pow_solver: PowSolver, storage: Storage | None = None) -> None:
+    def __init__(
+        self, pool: AccountPool, pow_solver: PowSolver, storage: Storage | None = None
+    ) -> None:
         self._pool = pool
         self._solver = pow_solver
         self._storage = storage
@@ -77,7 +79,7 @@ class ConversationManager:
         self._key_locks: dict[str, asyncio.Lock] = {}
         if self._storage is not None:
             self._load_from_storage()
-        self._sweeper: asyncio.Task | None = None
+        self._sweeper: asyncio.Task[None] | None = None
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
@@ -235,7 +237,14 @@ class ConversationManager:
         hashes: list[str] | None = None,
     ) -> TurnResult:
         async with self.key_lock(key):
-            return await self._run_turn_locked(key, prepared, deepthink=deepthink, model_type=model_type, max_retries=max_retries, hashes=hashes)
+            return await self._run_turn_locked(
+                key,
+                prepared,
+                deepthink=deepthink,
+                model_type=model_type,
+                max_retries=max_retries,
+                hashes=hashes,
+            )
 
     async def _run_turn_locked(
         self,
@@ -318,7 +327,9 @@ class ConversationManager:
                 conv.parent_message_id = None
                 self._persist_conversation(conv)
                 continue
-        final = last_ds_error or DeepSeekError(f"all accounts failed for this turn: {last_error}")
+        final = last_ds_error or DeepSeekError(
+            f"all accounts failed for this turn: {last_error}"
+        )
         raise final
 
     async def stream_turn(
@@ -334,7 +345,12 @@ class ConversationManager:
         async with self.key_lock(key):
             conv = await self.get_or_create(key)
             async for ev in self._stream_turn_locked(
-                key, conv, prepared, deepthink=deepthink, model_type=model_type, hashes=hashes
+                key,
+                conv,
+                prepared,
+                deepthink=deepthink,
+                model_type=model_type,
+                hashes=hashes,
             ):
                 yield ev
 
@@ -401,7 +417,9 @@ class ConversationManager:
                     model_type=effective_model,
                 ):
                     if ev.kind == "references":
-                        reference_urls.extend(ev.value if isinstance(ev.value, list) else [])
+                        reference_urls.extend(
+                            ev.value if isinstance(ev.value, list) else []
+                        )
                     elif ev.kind == "content":
                         chunk = rewriter.feed(str(ev.value))
                         if chunk:
@@ -484,7 +502,9 @@ class ConversationManager:
                         biz_code=getattr(exc, "biz_code", None),
                     ) from exc
                 continue
-        final = last_ds_error or DeepSeekError(f"all accounts failed for this turn: {last_error}")
+        final = last_ds_error or DeepSeekError(
+            f"all accounts failed for this turn: {last_error}"
+        )
         raise final
 
     # -- internals -----------------------------------------------------------
@@ -504,9 +524,7 @@ class ConversationManager:
                 filename.lower().endswith(ext)
                 for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
             )
-            ids.append(
-                await client.upload_file(filename, raw, mime, vision=is_image)
-            )
+            ids.append(await client.upload_file(filename, raw, mime, vision=is_image))
         return ids
 
     async def _collect(

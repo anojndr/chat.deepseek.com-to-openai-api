@@ -28,7 +28,9 @@ _CLIENT_HEADERS = {
 
 
 class DeepSeekError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None, biz_code: int | None = None) -> None:
+    def __init__(
+        self, message: str, status: int | None = None, biz_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.biz_code = biz_code
@@ -37,7 +39,9 @@ class DeepSeekError(RuntimeError):
 class DeepSeekClient:
     """One client per account token; safe for concurrent use."""
 
-    def __init__(self, token: str, pow_solver: PowSolver, timeout: float = 120.0) -> None:
+    def __init__(
+        self, token: str, pow_solver: PowSolver, timeout: float = 120.0
+    ) -> None:
         self.token = token
         self._pow = pow_solver
         self._http = httpx.AsyncClient(
@@ -73,12 +77,15 @@ class DeepSeekClient:
     def _check_biz(payload: dict[str, Any], context: str) -> dict[str, Any]:
         if payload.get("code") not in (0, None):
             raise DeepSeekError(
-                f"{context}: {payload.get('msg') or payload}", biz_code=payload.get("code")
+                f"{context}: {payload.get('msg') or payload}",
+                biz_code=payload.get("code"),
             )
         data = payload.get("data") or {}
         biz_code = data.get("biz_code")
         if biz_code not in (0, None):
-            raise DeepSeekError(f"{context}: {data.get('biz_msg') or data}", biz_code=biz_code)
+            raise DeepSeekError(
+                f"{context}: {data.get('biz_msg') or data}", biz_code=biz_code
+            )
         biz_data = data.get("biz_data")
         if not isinstance(biz_data, dict):
             raise DeepSeekError(f"{context}: response missing biz_data object")
@@ -90,33 +97,56 @@ class DeepSeekClient:
             raise DeepSeekError(f"{context}: missing '{key}' in response")
         return biz[key]
 
-    async def _get_pow(self, target_path: str) -> tuple[dict, dict]:
+    async def _get_pow(self, target_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch + solve a PoW challenge; one fresh challenge per call."""
         payload = await self._request_json(
-            "POST", "/api/v0/chat/create_pow_challenge",
+            "POST",
+            "/api/v0/chat/create_pow_challenge",
             json_body={"target_path": target_path},
         )
-        challenge = self._require(
+        raw_challenge = self._require(
             self._check_biz(payload, "create_pow_challenge"),
-            "challenge", "create_pow_challenge",
+            "challenge",
+            "create_pow_challenge",
         )
+        if not isinstance(raw_challenge, dict):
+            raise DeepSeekError("create_pow_challenge: 'challenge' is not an object")
+        challenge: dict[str, Any] = raw_challenge
+        challenge_hex = challenge.get("challenge")
+        salt = challenge.get("salt")
+        expire_at = challenge.get("expire_at")
+        if not isinstance(challenge_hex, str) or not challenge_hex:
+            raise DeepSeekError("create_pow_challenge: 'challenge' is not a string")
+        if not isinstance(salt, str) or not salt:
+            raise DeepSeekError("create_pow_challenge: 'salt' is not a string")
+        if not isinstance(expire_at, (str, int, float)):
+            raise DeepSeekError("create_pow_challenge: 'expire_at' is missing")
+        difficulty = challenge.get("difficulty", 144000)
+        if not isinstance(difficulty, (int, float)):
+            raise DeepSeekError("create_pow_challenge: 'difficulty' is not a number")
         answer = await asyncio.to_thread(
             self._pow.solve,
-            challenge["challenge"],
-            challenge["salt"],
-            challenge["expire_at"],
-            challenge.get("difficulty", 144000),
+            challenge_hex,
+            salt,
+            expire_at,
+            difficulty,
         )
         if answer is None:
             raise DeepSeekError("PoW solver found no solution")
+        algorithm = challenge.get("algorithm", "DeepSeekHashV1")
+        if not isinstance(algorithm, str) or not algorithm:
+            algorithm = "DeepSeekHashV1"
+        signature = challenge.get("signature")
+        if not isinstance(signature, str) or not signature:
+            raise DeepSeekError("create_pow_challenge: 'signature' is not a string")
         header_value = base64.b64encode(
             json.dumps(
                 {
-                    "algorithm": challenge.get("algorithm", "DeepSeekHashV1"),
-                    "challenge": challenge["challenge"],
-                    "salt": challenge["salt"],
+                    "algorithm": algorithm,
+                    "challenge": challenge_hex,
+                    "salt": salt,
                     "answer": answer,
-                    "signature": challenge["signature"],
+                    "signature": signature,
                     "target_path": target_path,
                 }
             ).encode()
@@ -126,10 +156,17 @@ class DeepSeekClient:
     # -- API surface -------------------------------------------------------
 
     async def create_session(self) -> str:
-        payload = await self._request_json("POST", "/api/v0/chat_session/create", json_body={})
+        payload = await self._request_json(
+            "POST", "/api/v0/chat_session/create", json_body={}
+        )
         biz = self._check_biz(payload, "create_chat_session")
         session = self._require(biz, "chat_session", "create_chat_session")
-        return self._require(session, "id", "create_chat_session")
+        if not isinstance(session, dict):
+            raise DeepSeekError("create_chat_session: 'chat_session' is not an object")
+        session_id = self._require(session, "id", "create_chat_session")
+        if not isinstance(session_id, str) or not session_id:
+            raise DeepSeekError("create_chat_session: 'id' is not a string")
+        return session_id
 
     async def delete_session(self, session_id: str) -> None:
         try:
@@ -148,26 +185,51 @@ class DeepSeekClient:
             payload = check.json()
         except ValueError:
             return None
-        data = (payload.get("data") or {}).get("biz_data") or {}
-        items = data.get("files") or []
-        info = next((f for f in items if f.get("id") == fid), None)
-        return (info or {}) .get("status")
+        if not isinstance(payload, dict):
+            return None
+        data_obj = payload.get("data") or {}
+        if not isinstance(data_obj, dict):
+            return None
+        biz_data = data_obj.get("biz_data") or {}
+        if not isinstance(biz_data, dict):
+            return None
+        files_obj = biz_data.get("files") or []
+        if not isinstance(files_obj, list):
+            return None
+        info: dict[str, Any] | None = None
+        for entry in files_obj:
+            if isinstance(entry, dict) and entry.get("id") == fid:
+                info = entry
+                break
+        if info is None:
+            return None
+        status = info.get("status")
+        return status if isinstance(status, str) else None
 
     async def upload_file(
-        self, filename: str, content: bytes, mime: str | None = None, *, vision: bool = False
+        self,
+        filename: str,
+        content: bytes,
+        mime: str | None = None,
+        *,
+        vision: bool = False,
     ) -> str:
         """Upload a file; when `vision`, fork it so images get parsed for vision."""
         headers, _ = await self._get_pow(TARGET_UPLOAD)
         files = {"file": (filename, content, mime or "application/octet-stream")}
-        resp = await self._http.post("/api/v0/file/upload_file", files=files, headers=headers)
+        resp = await self._http.post(
+            "/api/v0/file/upload_file", files=files, headers=headers
+        )
         if resp.status_code >= 400:
             raise DeepSeekError(
                 f"upload_file returned HTTP {resp.status_code}: {resp.text[:200]}",
                 status=resp.status_code,
             )
         biz = self._check_biz(resp.json(), "upload_file")
-        file_id = self._require(biz, "id", "upload_file")
-
+        raw_file_id = self._require(biz, "id", "upload_file")
+        if not isinstance(raw_file_id, str) or not raw_file_id:
+            raise DeepSeekError("upload_file: 'id' is not a string")
+        file_id: str = raw_file_id
         terminal = ("SUCCESS", "CONTENT_EMPTY", "ERROR", "REJECTED")
 
         async def wait_terminal(fid: str, seconds: float) -> str | None:
@@ -194,18 +256,20 @@ class DeepSeekClient:
             # the parse to reach a TERMINAL state before forking.
             st = await wait_terminal(file_id, 30.0)
             if st not in ("SUCCESS", "CONTENT_EMPTY"):
-                raise DeepSeekError(f"initial upload parse failed ({st or 'timed out'})")
+                raise DeepSeekError(
+                    f"initial upload parse failed ({st or 'timed out'})"
+                )
 
         if vision:
             payload = await self._request_json(
-                "POST", "/api/v0/file/fork_file_task",
+                "POST",
+                "/api/v0/file/fork_file_task",
                 json_body={"file_id": file_id, "to_model_type": "vision"},
             )
             forked = self._check_biz(payload, "fork_file_task")
             new_file = forked.get("file")
-            new_id = (
-                forked.get("id")
-                or (new_file.get("id") if isinstance(new_file, dict) else None)
+            new_id = forked.get("id") or (
+                new_file.get("id") if isinstance(new_file, dict) else None
             )
             if not new_id:
                 raise DeepSeekError("fork_file_task response missing new file id")
@@ -262,7 +326,9 @@ class DeepSeekClient:
                     if data_lines:
                         raw = "\n".join(data_lines)
                         try:
-                            payload = json.loads(raw) if raw and raw != "[DONE]" else None
+                            payload = (
+                                json.loads(raw) if raw and raw != "[DONE]" else None
+                            )
                         except json.JSONDecodeError:
                             payload = {"v": raw}
                         yield {"event": event_name, "data": payload}

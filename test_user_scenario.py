@@ -1,39 +1,84 @@
 """Regression tests: Verify tree branching and new chat isolation matching the reported user issue."""
 
-import asyncio
+from __future__ import annotations
+
 import tempfile
-import time
 import unittest
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any, override
+
 from fastapi.testclient import TestClient
 
-from app.storage import Storage
 from app.accounts import AccountPool
 from app.conversations import ConversationManager
-from app.turn import prepare_turn
+from app.deepseek import DeepSeekClient
+from app.pow_solver import PowSolver
+from app.storage import Storage
 import app.main as main_mod
 
 
-class FakeDeepSeekClient:
-    def __init__(self, token: str) -> None:
+class DummySolver(PowSolver):
+    """Test double that never touches wasm."""
+
+    def __init__(self) -> None:
+        pass
+
+    @override
+    def solve(
+        self,
+        challenge_hex: str,
+        salt: str,
+        expire_at: str | int | float,
+        difficulty: float | int,
+    ) -> int | None:
+        return None
+
+
+class FakeDeepSeekClient(DeepSeekClient):
+    def __init__(
+        self, token: str, pow_solver: PowSolver | None = None, timeout: float = 120.0
+    ) -> None:
         self.token = token
         self.created_sessions: list[str] = []
-        self.recorded_calls: list[dict] = []
+        self.recorded_calls: list[dict[str, Any]] = []
 
+    @override
     async def create_session(self) -> str:
         sid = f"sess_{len(self.created_sessions) + 1}"
         self.created_sessions.append(sid)
         return sid
 
-    async def upload_file(self, *a, **k):
+    @override
+    async def upload_file(
+        self,
+        filename: str,
+        content: bytes,
+        mime: str | None = None,
+        *,
+        vision: bool = False,
+    ) -> str:
         return "file_123"
 
-    async def stream_completion(self, *, prompt: str, chat_session_id: str, parent_message_id: int | None = None, **kwargs):
-        self.recorded_calls.append({
-            "prompt": prompt,
-            "chat_session_id": chat_session_id,
-            "parent_message_id": parent_message_id,
-        })
+    @override
+    async def stream_completion(
+        self,
+        *,
+        prompt: str,
+        chat_session_id: str,
+        parent_message_id: int | None = None,
+        ref_file_ids: list[str] | None = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = True,
+        model_type: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.recorded_calls.append(
+            {
+                "prompt": prompt,
+                "chat_session_id": chat_session_id,
+                "parent_message_id": parent_message_id,
+            }
+        )
         # Simulate DeepSeek server message id assignment
         # If parent_message_id is None, it's root (msg 101, reply 102)
         # If parent_message_id is 102, reply is 104, etc.
@@ -59,11 +104,20 @@ class FakeDeepSeekClient:
         yield {"event": "ready", "data": {"response_message_id": rid}}
         yield {
             "event": None,
-            "data": {"p": "response/fragments", "o": "APPEND", "v": {"type": "RESPONSE", "content": ""}},
+            "data": {
+                "p": "response/fragments",
+                "o": "APPEND",
+                "v": {"type": "RESPONSE", "content": ""},
+            },
         }
         yield {"event": None, "data": {"v": ans}}
 
-    async def aclose(self):
+    @override
+    async def aclose(self) -> None:
+        pass
+
+    @override
+    async def delete_session(self, session_id: str) -> None:
         pass
 
 
@@ -87,8 +141,13 @@ class TestUserScenario(unittest.TestCase):
 
         # 2. Vision [!citation:N] markers linking
         raw_cite = "From the anime **Buddy Complex** [!citation:1][!citation:2]."
-        rewritten = rewrite_citations(raw_cite, ["https://example.com/1", "https://example.com/2"])
-        self.assertEqual(rewritten, "From the anime **Buddy Complex** [citation:1](https://example.com/1) [citation:2](https://example.com/2).")
+        rewritten = rewrite_citations(
+            raw_cite, ["https://example.com/1", "https://example.com/2"]
+        )
+        self.assertEqual(
+            rewritten,
+            "From the anime **Buddy Complex** [citation:1](https://example.com/1) [citation:2](https://example.com/2).",
+        )
 
         # 3. Streaming chunk boundaries across space and period
         rw = CitationRewriter([])
@@ -96,7 +155,7 @@ class TestUserScenario(unittest.TestCase):
             "This girl is **Hina Yumihara** from the 2014 mecha anime **Buddy Complex** ",
             ".\n\n*   **Studio**: Sunrise ",
             " .\n*   **Plot Summary**: High school student",
-            " ."
+            " .",
         ]
         streamed = "".join(rw.feed(c) for c in chunks) + rw.finish()
         self.assertNotIn(" .", streamed)
@@ -104,7 +163,8 @@ class TestUserScenario(unittest.TestCase):
         self.assertIn("Sunrise.", streamed)
         self.assertIn("High school student.", streamed)
 
-    def setUp(self):
+    @override
+    def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmpdir.name) / "test_data.sqlite"
         self.accounts_path = Path(self.tmpdir.name) / "accounts.txt"
@@ -113,10 +173,9 @@ class TestUserScenario(unittest.TestCase):
         self.storage = Storage(self.db_path)
         self.pool = AccountPool(self.accounts_path)
 
-        class DummySolver:
-            pass
-
-        self.manager = ConversationManager(self.pool, DummySolver(), storage=self.storage)
+        self.manager = ConversationManager(
+            self.pool, DummySolver(), storage=self.storage
+        )
         self.fake_client = FakeDeepSeekClient("test_tok_1")
         self.manager._clients["test_tok_1"] = self.fake_client
 
@@ -126,13 +185,21 @@ class TestUserScenario(unittest.TestCase):
         main_mod._manager = self.manager
         self.client = TestClient(main_mod.app)
 
-    def tearDown(self):
+    @override
+    def tearDown(self) -> None:
         self.tmpdir.cleanup()
 
     def test_user_branching_and_new_chat_scenario(self):
         # 1. Turn 1: My name is Petrig. Answer in one sentence only.
-        msgs = [{"role": "user", "content": "My name is Petrig. Answer in one sentence only."}]
-        r1 = self.client.post("/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs})
+        msgs = [
+            {
+                "role": "user",
+                "content": "My name is Petrig. Answer in one sentence only.",
+            }
+        ]
+        r1 = self.client.post(
+            "/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs}
+        )
         self.assertEqual(r1.status_code, 200)
         ans1 = r1.json()["choices"][0]["message"]["content"]
         self.assertEqual(ans1, "Your name is Petrig.")
@@ -140,8 +207,15 @@ class TestUserScenario(unittest.TestCase):
 
         # 2. Turn 2: what is my name again? Answer in one sentence only.
         msgs.append({"role": "assistant", "content": ans1})
-        msgs.append({"role": "user", "content": "what is my name again? Answer in one sentence only."})
-        r2 = self.client.post("/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs})
+        msgs.append(
+            {
+                "role": "user",
+                "content": "what is my name again? Answer in one sentence only.",
+            }
+        )
+        r2 = self.client.post(
+            "/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs}
+        )
         self.assertEqual(r2.status_code, 200)
         ans2 = r2.json()["choices"][0]["message"]["content"]
         self.assertEqual(ans2, "Your name is Petrig.")
@@ -150,8 +224,16 @@ class TestUserScenario(unittest.TestCase):
         # 3. Branch A: remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.
         branch_a = list(msgs)
         branch_a.append({"role": "assistant", "content": ans2})
-        branch_a.append({"role": "user", "content": 'remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.'})
-        r3_a = self.client.post("/v1/chat/completions", json={"model": "deepseek-chat", "messages": branch_a})
+        branch_a.append(
+            {
+                "role": "user",
+                "content": 'remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.',
+            }
+        )
+        r3_a = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": branch_a},
+        )
         self.assertEqual(r3_a.status_code, 200)
         ans3_a = r3_a.json()["choices"][0]["message"]["content"]
         self.assertEqual(ans3_a, "understood")
@@ -160,8 +242,13 @@ class TestUserScenario(unittest.TestCase):
         # 4. Branch B: replied at output "Your name is Petrig." (after Turn 2, BEFORE Turn 3)
         branch_b = list(msgs)
         branch_b.append({"role": "assistant", "content": ans2})
-        branch_b.append({"role": "user", "content": "what string did i ask you to remember again?"})
-        r3_b = self.client.post("/v1/chat/completions", json={"model": "deepseek-chat", "messages": branch_b})
+        branch_b.append(
+            {"role": "user", "content": "what string did i ask you to remember again?"}
+        )
+        r3_b = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": branch_b},
+        )
         self.assertEqual(r3_b.status_code, 200)
         ans3_b = r3_b.json()["choices"][0]["message"]["content"]
         # Must branch from Turn 2 (parent_message_id == 102), NOT from Branch A (parent_message_id == 103)
@@ -171,7 +258,15 @@ class TestUserScenario(unittest.TestCase):
         # 5. New chat 1: "what is my name again? Answer in one sentence only." on its own
         r_new_1 = self.client.post(
             "/v1/chat/completions",
-            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "what is my name again? Answer in one sentence only."}]},
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "what is my name again? Answer in one sentence only.",
+                    }
+                ],
+            },
         )
         self.assertEqual(r_new_1.status_code, 200)
         ans_new_1 = r_new_1.json()["choices"][0]["message"]["content"]
@@ -182,7 +277,15 @@ class TestUserScenario(unittest.TestCase):
         # 6. New chat 2: "what string did i ask you to remember again?" on its own
         r_new_2 = self.client.post(
             "/v1/chat/completions",
-            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "what string did i ask you to remember again?"}]},
+            json={
+                "model": "deepseek-chat",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "what string did i ask you to remember again?",
+                    }
+                ],
+            },
         )
         self.assertEqual(r_new_2.status_code, 200)
         ans_new_2 = r_new_2.json()["choices"][0]["message"]["content"]

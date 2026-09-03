@@ -25,7 +25,9 @@ def _pip_supports(flag: str) -> bool:
     try:
         out = subprocess.run(
             [sys.executable, "-m", "pip", "install", "--help"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         return flag in (out.stdout + out.stderr)
     except Exception:
@@ -35,6 +37,7 @@ def _pip_supports(flag: str) -> bool:
 def ensure_wasmtime() -> None:
     try:
         import wasmtime  # noqa: F401
+
         return
     except Exception:
         pass

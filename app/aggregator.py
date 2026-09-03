@@ -60,11 +60,14 @@ class FragmentAggregator:
                     self._capture_results(frag.get("results"))
                 queries = frag.get("queries")
                 if isinstance(queries, list) and queries:
-                    yield "search", [
-                        q.get("query") if isinstance(q, dict) else str(q)
-                        for q in queries
-                        if (q.get("query") if isinstance(q, dict) else q)
-                    ]
+                    yield (
+                        "search",
+                        [
+                            q.get("query") if isinstance(q, dict) else str(q)
+                            for q in queries
+                            if (q.get("query") if isinstance(q, dict) else q)
+                        ],
+                    )
                 if self._is_content_frag(frag) or ftype == "THINK":
                     self.current = idx
                 elif ftype in ("TOOL_SEARCH", "SEARCH"):
@@ -151,11 +154,14 @@ class FragmentAggregator:
                         self._capture_results(frag.get("results"))
                         queries = frag.get("queries")
                         if isinstance(queries, list) and queries:
-                            yield "search", [
-                                q.get("query") if isinstance(q, dict) else str(q)
-                                for q in queries
-                                if (q.get("query") if isinstance(q, dict) else q)
-                            ]
+                            yield (
+                                "search",
+                                [
+                                    q.get("query") if isinstance(q, dict) else str(q)
+                                    for q in queries
+                                    if (q.get("query") if isinstance(q, dict) else q)
+                                ],
+                            )
                         continue
                     if self._is_content_frag(frag) or frag.get("type") == "THINK":
                         self.current = len(self.fragments) - 1

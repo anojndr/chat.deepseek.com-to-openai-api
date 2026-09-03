@@ -1,13 +1,33 @@
 """Unit tests for SQLite storage and persistence across restarts."""
 
-import os
+from __future__ import annotations
+
 import tempfile
 import time
 from pathlib import Path
-from app.storage import Storage
-from app.conversations import ConversationManager, Conversation
+from typing import override
+
 from app.accounts import AccountPool
+from app.conversations import ConversationManager
 from app.pow_solver import PowSolver
+from app.storage import Storage
+
+
+class DummySolver(PowSolver):
+    """Test double that never touches wasm; persistence tests need no PoW."""
+
+    def __init__(self) -> None:
+        pass
+
+    @override
+    def solve(
+        self,
+        challenge_hex: str,
+        salt: str,
+        expire_at: str | int | float,
+        difficulty: float | int,
+    ) -> int | None:
+        return None
 
 
 def test_storage_basic():
@@ -61,6 +81,7 @@ def test_storage_basic():
         )
 
         conv = storage.get_conversation("conv-1")
+        assert conv is not None
         assert conv["parent_message_id"] == 44
         assert len(conv["history"]) == 4
 
@@ -84,11 +105,6 @@ async def test_conversation_manager_persistence():
         accounts_file.write_text('account 1\n{"userToken": "test_token"}')
         pool = AccountPool(accounts_file)
 
-        # Mock solver or create dummy
-        class DummySolver:
-            pass
-
-        # Simulate instance 1
         storage1 = Storage(db_path)
         mgr1 = ConversationManager(pool, DummySolver(), storage=storage1)
 

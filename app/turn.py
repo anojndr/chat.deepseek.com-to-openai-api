@@ -57,7 +57,8 @@ def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]]]:
                     {
                         "kind": "file",
                         "filename": file_info.get("filename"),
-                        "file_data": part.get("file_data") or file_info.get("file_data"),
+                        "file_data": part.get("file_data")
+                        or file_info.get("file_data"),
                         "file_id": part.get("file_id") or file_info.get("file_id"),
                     }
                 )
@@ -67,7 +68,8 @@ def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]]]:
                     {
                         "kind": "file",
                         "filename": file_info.get("filename"),
-                        "file_data": part.get("file_data") or file_info.get("file_data"),
+                        "file_data": part.get("file_data")
+                        or file_info.get("file_data"),
                     }
                 )
             elif ptype == "refusal":
@@ -78,14 +80,19 @@ def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]]]:
     return "\n".join(p for p in parts_out if p), files
 
 
-
-
-
 _MIME_EXT = {
-    "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
-    "image/webp": "webp", "image/bmp": "bmp", "image/svg+xml": "svg",
-    "application/pdf": "pdf", "text/plain": "txt", "text/markdown": "md",
-    "text/csv": "csv", "application/json": "json", "text/html": "html",
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/bmp": "bmp",
+    "image/svg+xml": "svg",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/csv": "csv",
+    "application/json": "json",
+    "text/html": "html",
 }
 
 
@@ -95,6 +102,7 @@ def ensure_extension(filename: str, mime: str | None) -> str:
         return filename
     ext = _MIME_EXT.get(mime or "", "bin")
     return f"{filename}.{ext}"
+
 
 def item_hash(prev: str, role: str, canon: str) -> str:
     h = hashlib.sha256()
@@ -211,20 +219,19 @@ def prepare_turn(
         if system_chunks:
             lines.extend(system_chunks)
         for role_name, text in history:
-            prefix = {"user": "[user]", "assistant": "[assistant]", "tool": "[tool result]"}[
-                role_name
-            ]
-            lines.append(f"{prefix} {text}" if text and not text.startswith(prefix) else text)
+            prefix = {
+                "user": "[user]",
+                "assistant": "[assistant]",
+                "tool": "[tool result]",
+            }[role_name]
+            lines.append(
+                f"{prefix} {text}" if text and not text.startswith(prefix) else text
+            )
         prompt = "\n\n".join(lines).strip()
     else:
         prompt = latest_user_text.strip()
         if system_chunks:
-            prompt = (
-                "[system reminder]\n"
-                + "\n".join(system_chunks)
-                + "\n\n"
-                + prompt
-            )
+            prompt = "[system reminder]\n" + "\n".join(system_chunks) + "\n\n" + prompt
 
     all_files: list[dict[str, Any]] = []
     if is_first_turn:

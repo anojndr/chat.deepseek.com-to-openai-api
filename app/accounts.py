@@ -12,6 +12,7 @@ import re
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 
 class Account:
@@ -143,7 +144,7 @@ class AccountPool:
         with self._lock:
             return [a.token for a in self._accounts]
 
-    def snapshot(self) -> list[dict]:
+    def snapshot(self) -> list[dict[str, Any]]:
         now = time.monotonic()
         with self._lock:
             return [

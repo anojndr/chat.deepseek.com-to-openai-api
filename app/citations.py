@@ -26,7 +26,7 @@ def _host_of(url: str) -> str:
         return ""
 
 
-def source_appendix(sources: list[Any], queries: list[str] | str | None = None) -> str:
+def source_appendix(sources: list[Any], queries: list[Any] | str | None = None) -> str:
     """Bridge source appendix for llmcord-go's "Show Sources" button.
 
     Matches the appendix contract parsed by llmcord-go across bridge providers:
@@ -42,10 +42,18 @@ def source_appendix(sources: list[Any], queries: list[str] | str | None = None) 
     query_str = ""
     if isinstance(queries, list) and queries:
         first_q = queries[0]
-        query_str = first_q if isinstance(first_q, str) else str(first_q) if first_q is not None else ""
+        query_str = (
+            first_q
+            if isinstance(first_q, str)
+            else str(first_q)
+            if first_q is not None
+            else ""
+        )
     elif isinstance(queries, str):
         query_str = queries
-    clean_query = " ".join(query_str.split()).replace("`", "'").strip() if query_str else ""
+    clean_query = (
+        " ".join(query_str.split()).replace("`", "'").strip() if query_str else ""
+    )
 
     for src in sources[:SOURCE_APPENDIX_MAX]:
         raw_url = None
@@ -85,6 +93,7 @@ def source_appendix(sources: list[Any], queries: list[str] | str | None = None) 
         lines.append(f"1. `{clean_query}`")
     return "\n\n" + "\n".join(lines)
 
+
 _CITE = re.compile(r"\[!?citation:(\d+)\]")
 _ADJACENT = re.compile(r"(\[!?[cC]itation:\d+\])(?=\[!?[cC]itation:)")
 _HEADS = ("[citation:", "[!citation:")
@@ -106,7 +115,9 @@ def _holdback_len(text: str) -> int:
     if len(suffix) > 20:  # longest possible partial
         return 0
     for h in _HEADS:
-        if h.startswith(suffix) or (suffix.lower().startswith(h) and suffix[len(h) :].isdigit()):
+        if h.startswith(suffix) or (
+            suffix.lower().startswith(h) and suffix[len(h) :].isdigit()
+        ):
             return len(suffix)
     return 0
 
@@ -141,7 +152,7 @@ class CitationRewriter:
         hold = _holdback_len(out)
         if hold:
             self._pending = out[-hold:]
-            out = out[: -hold]
+            out = out[:-hold]
         space_hold = 0
         while len(out) > space_hold and out[-1 - space_hold] == " ":
             space_hold += 1
@@ -149,7 +160,9 @@ class CitationRewriter:
             self._pending = out[-space_hold:] + self._pending
             out = out[:-space_hold]
         if out:
-            self._ended_with_cite = bool(re.search(r"(\[!?citation:\d+\](?:\(\S*\))?)$", out))
+            self._ended_with_cite = bool(
+                re.search(r"(\[!?citation:\d+\](?:\(\S*\))?)$", out)
+            )
         return out
 
     def finish(self) -> str:

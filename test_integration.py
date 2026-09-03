@@ -1,16 +1,36 @@
 """Integration test for full FastAPI app with SQLite storage across restarts."""
 
-import os
+from __future__ import annotations
+
 import tempfile
 import time
 from pathlib import Path
+from typing import override
+
 from fastapi.testclient import TestClient
 
-from app.storage import Storage
 from app.accounts import AccountPool
-from app.pow_solver import PowSolver
 from app.conversations import ConversationManager
+from app.pow_solver import PowSolver
+from app.storage import Storage
 import app.main as main_mod
+
+
+class DummySolver(PowSolver):
+    """Test double that never touches wasm."""
+
+    def __init__(self) -> None:
+        pass
+
+    @override
+    def solve(
+        self,
+        challenge_hex: str,
+        salt: str,
+        expire_at: str | int | float,
+        difficulty: float | int,
+    ) -> int | None:
+        return None
 
 
 def test_app_sqlite_integration():
@@ -22,9 +42,6 @@ def test_app_sqlite_integration():
         # Setup storage and app components
         storage = Storage(db_path)
         pool = AccountPool(accounts_path)
-
-        class DummySolver:
-            pass
 
         manager = ConversationManager(pool, DummySolver(), storage=storage)
 
@@ -62,7 +79,10 @@ def test_app_sqlite_integration():
         data = res.json()
         assert data["id"] == "resp_test_1"
         assert data["model"] == "deepseek-chat"
-        assert data["output"][0]["content"][0]["text"] == "Python is a programming language."
+        assert (
+            data["output"][0]["content"][0]["text"]
+            == "Python is a programming language."
+        )
 
         # 4. Simulate complete server restart: clear in-memory maps and re-instantiate
         main_mod._response_links.clear()
@@ -76,7 +96,10 @@ def test_app_sqlite_integration():
         assert res_after.status_code == 200
         data_after = res_after.json()
         assert data_after["id"] == "resp_test_1"
-        assert data_after["output"][0]["content"][0]["text"] == "Python is a programming language."
+        assert (
+            data_after["output"][0]["content"][0]["text"]
+            == "Python is a programming language."
+        )
 
         # 6. Delete session endpoint
         del_res = client.delete("/v1/sessions/conv_session_1")

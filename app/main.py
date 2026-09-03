@@ -8,7 +8,9 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -28,12 +30,12 @@ from .storage import Storage, ConvRef
 from .turn import prepare_turn, compute_history_hashes
 
 ROOT = Path(__file__).resolve().parent.parent
-ACCOUNTS_PATH = Path("/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt")
+ACCOUNTS_PATH = Path(
+    "/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt"
+)
 if not ACCOUNTS_PATH.exists():
     ACCOUNTS_PATH = ROOT / "accounts.txt"
 DB_PATH = ROOT / "data.sqlite"
-
-app = FastAPI(title="DeepSeek OpenAI-Compatible API", version="1.0.0")
 
 _pool = AccountPool(ACCOUNTS_PATH)
 _solver: PowSolver | None = None
@@ -41,7 +43,26 @@ _storage = Storage(DB_PATH)
 _manager: ConversationManager | None = None
 
 
-def manager() -> "ConversationManager":
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global _solver, _manager
+    if _solver is None:
+        _solver = PowSolver()
+    if _manager is None:
+        _manager = ConversationManager(_pool, _solver, storage=_storage)
+    else:
+        _manager.ensure_sweeper()
+    yield
+    if _manager is not None:
+        await manager().aclose()
+
+
+app = FastAPI(
+    title="DeepSeek OpenAI-Compatible API", version="1.0.0", lifespan=lifespan
+)
+
+
+def manager() -> ConversationManager:
     assert _manager is not None, "startup hook has not run"
     return _manager
 
@@ -50,10 +71,15 @@ API_KEY: str | None = os.environ.get("API_KEY")
 _INCLUDE_SOURCES_RAW = os.environ.get("DEEPSEEK_INCLUDE_SOURCES")
 if _INCLUDE_SOURCES_RAW is None:
     _INCLUDE_SOURCES_RAW = os.environ.get("INCLUDE_SOURCES", "0")
-INCLUDE_SOURCES: bool = _INCLUDE_SOURCES_RAW.strip().lower() in ("1", "true", "yes", "on")
+INCLUDE_SOURCES: bool = _INCLUDE_SOURCES_RAW.strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
-def _include_sources(flag: Any) -> bool:
+def _include_sources(flag: Any | None) -> bool:
     """Per-request override; falls back to the DEEPSEEK_INCLUDE_SOURCES config flag."""
     if flag is None:
         return INCLUDE_SOURCES
@@ -72,7 +98,9 @@ async def require_api_key(request: Request) -> None:
         return
     header = request.headers.get("authorization", "")
     provided = (
-        header[7:].strip() if header.startswith("Bearer ") else request.headers.get("x-api-key", "")
+        header[7:].strip()
+        if header.startswith("Bearer ")
+        else request.headers.get("x-api-key", "")
     )
     if provided != API_KEY:
         # must raise: returning a Response from a dependency does not
@@ -81,7 +109,9 @@ async def require_api_key(request: Request) -> None:
 
 
 @app.exception_handler(MissingApiKey)
-async def _missing_api_key_handler(request: Request, exc: MissingApiKey):
+async def _missing_api_key_handler(
+    request: Request, exc: MissingApiKey
+) -> JSONResponse:
     return JSONResponse(
         status_code=401,
         content={
@@ -94,29 +124,14 @@ async def _missing_api_key_handler(request: Request, exc: MissingApiKey):
     )
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    global _solver, _manager
-    if _solver is None:
-        _solver = PowSolver()
-    if _manager is None:
-        _manager = ConversationManager(_pool, _solver, storage=_storage)
-    else:
-        _manager.ensure_sweeper()
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _manager is not None:
-        await manager().aclose()
-
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
 
-def _error(message: str, status: int = 502, err_type: str = "upstream_error") -> JSONResponse:
+def _error(
+    message: str, status: int = 502, err_type: str = "upstream_error"
+) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": err_type, "code": None}},
@@ -137,7 +152,7 @@ def _http_error(exc: DeepSeekError) -> JSONResponse:
     return _error(str(exc), mapped, etype)
 
 
-def _sse(data: dict) -> str:
+def _sse(data: dict[str, Any]) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -155,7 +170,7 @@ def _conversation_key(req: Request, body_user: str | None) -> str:
 
 
 @app.get("/")
-async def root() -> dict:
+async def root() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "chat.deepseek.com → OpenAI-compatible API",
@@ -166,15 +181,20 @@ async def root() -> dict:
 
 @app.get("/health")
 @app.get("/v1/health")
-async def health() -> dict:
+async def health() -> dict[str, Any]:
     return {"status": "ok", "accounts": _pool.snapshot()}
 
 
 @app.get("/v1/models")
-async def list_models() -> dict:
+async def list_models() -> dict[str, Any]:
     now = int(time.time())
     models = [
-        {"id": "deepseek-chat", "object": "model", "created": now, "owned_by": "deepseek-proxy"},
+        {
+            "id": "deepseek-chat",
+            "object": "model",
+            "created": now,
+            "owned_by": "deepseek-proxy",
+        },
         {
             "id": "deepseek-chat-deepthink",
             "object": "model",
@@ -210,7 +230,7 @@ async def list_models() -> dict:
 
 
 @app.post("/accounts/reload", dependencies=[Depends(require_api_key)])
-async def reload_accounts() -> dict:
+async def reload_accounts() -> dict[str, Any]:
     count = _pool.reload()
     removed = await manager().invalidate_clients(set(_pool.tokens()))
     return {
@@ -226,7 +246,9 @@ async def reload_accounts() -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.post("/v1/chat/completions", response_model=None, dependencies=[Depends(require_api_key)])
+@app.post(
+    "/v1/chat/completions", response_model=None, dependencies=[Depends(require_api_key)]
+)
 async def chat_completions(request: Request) -> StreamingResponse | JSONResponse:
     try:
         body = ChatCompletionRequest(**(await request.json()))
@@ -257,13 +279,17 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         if ref is not None and matched_len >= len(hashes):
             # Exact duplicate request: re-match at matched_len - 1
             matched_len = len(hashes) - 1
-            rematch = _storage.find_prefix(hashes[:matched_len]) if (matched_len > 0 and _storage is not None) else None
+            rematch = (
+                _storage.find_prefix(hashes[:matched_len])
+                if (matched_len > 0 and _storage is not None)
+                else None
+            )
             ref = rematch[1] if rematch else None
 
         if ref is not None:
             # Fork into a distinct conversation instance referencing the parent checkpoint
             # Only continue incrementally if the prefix matches up to the immediate parent message
-            is_immediate_parent = (matched_len == len(hashes) - 1)
+            is_immediate_parent = matched_len == len(hashes) - 1
             key = f"auto:{uuid.uuid4().hex}"
             conv = await manager().get_or_create(key)
             conv.account_index = ref.account_index
@@ -304,18 +330,24 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
 
     try:
         result = await manager().run_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
+            key,
+            prepared,
+            deepthink=spec.deepthink,
+            model_type=spec.model_type,
+            hashes=hashes,
         )
     except DeepSeekError as exc:
         return _http_error(exc)
 
     final_content = result.content
     if req_include_sources and result.sources:
-        appendix_query = result.search_queries[0] if result.search_queries else prepared.prompt
+        appendix_query = (
+            result.search_queries[0] if result.search_queries else prepared.prompt
+        )
         appendix = source_appendix(result.sources, appendix_query)
         final_content = final_content + appendix
 
-    message: dict = {"role": "assistant", "content": final_content}
+    message: dict[str, Any] = {"role": "assistant", "content": final_content}
     usage = {
         "prompt_tokens": _estimate(prepared.prompt),
         "completion_tokens": _estimate(final_content),
@@ -351,7 +383,7 @@ async def _chat_stream(
     include_sources: bool = False,
     hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
-    def chunk(delta: dict, finish: str | None = None) -> str:
+    def chunk(delta: dict[str, Any], finish: str | None = None) -> str:
         return _sse(
             {
                 "id": completion_id,
@@ -359,7 +391,12 @@ async def _chat_stream(
                 "created": created,
                 "model": model_id,
                 "choices": [
-                    {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
+                    {
+                        "index": 0,
+                        "delta": delta,
+                        "logprobs": None,
+                        "finish_reason": finish,
+                    }
                 ],
             }
         )
@@ -370,7 +407,11 @@ async def _chat_stream(
     sources: list[dict[str, Any]] = []
     try:
         async for ev in manager().stream_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
+            key,
+            prepared,
+            deepthink=spec.deepthink,
+            model_type=spec.model_type,
+            hashes=hashes,
         ):
             if ev.kind == "reasoning":
                 yield chunk({"reasoning_content": str(ev.value)})
@@ -411,7 +452,15 @@ async def _chat_stream(
     except DeepSeekError as exc:
         # OpenAI SDKs raise when an SSE payload carries a top-level "error";
         # emit that (no finish_reason, no [DONE]) so truncation is visible.
-        yield _sse({"error": {"message": str(exc), "type": "upstream_error", "code": exc.biz_code}})
+        yield _sse(
+            {
+                "error": {
+                    "message": str(exc),
+                    "type": "upstream_error",
+                    "code": exc.biz_code,
+                }
+            }
+        )
 
 
 def _estimate(text: str) -> int:
@@ -462,11 +511,15 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
 
         if ref is not None and matched_len >= len(hashes):
             matched_len = len(hashes) - 1
-            rematch = _storage.find_prefix(hashes[:matched_len]) if (matched_len > 0 and _storage is not None) else None
+            rematch = (
+                _storage.find_prefix(hashes[:matched_len])
+                if (matched_len > 0 and _storage is not None)
+                else None
+            )
             ref = rematch[1] if rematch else None
 
         if ref is not None:
-            is_immediate_parent = (matched_len == len(hashes) - 1)
+            is_immediate_parent = matched_len == len(hashes) - 1
             key = f"auto:{uuid.uuid4().hex}"
             conv = await manager().get_or_create(key)
             conv.account_index = ref.account_index
@@ -487,7 +540,9 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
     created = int(time.time())
     req_include_sources = _include_sources(body.include_sources)
 
-    def base_response(status: str = "in_progress", output: list | None = None) -> dict:
+    def base_response(
+        status: str = "in_progress", output: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         return {
             "id": response_id,
             "object": "response",
@@ -501,7 +556,10 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
             "output": output or [],
             "parallel_tool_calls": True,
             "previous_response_id": body.previous_response_id,
-            "reasoning": {"effort": "high" if spec.deepthink else None, "summary": None},
+            "reasoning": {
+                "effort": "high" if spec.deepthink else None,
+                "summary": None,
+            },
             "store": False,
             "temperature": body.temperature,
             "text": {"format": {"type": "text"}},
@@ -536,18 +594,24 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
 
     try:
         result = await manager().run_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
+            key,
+            prepared,
+            deepthink=spec.deepthink,
+            model_type=spec.model_type,
+            hashes=hashes,
         )
     except DeepSeekError as exc:
         return _http_error(exc)
 
     final_content = result.content
     if req_include_sources and result.sources:
-        appendix_query = result.search_queries[0] if result.search_queries else prepared.prompt
+        appendix_query = (
+            result.search_queries[0] if result.search_queries else prepared.prompt
+        )
         appendix = source_appendix(result.sources, appendix_query)
         final_content = final_content + appendix
 
-    output_items: list[dict] = []
+    output_items: list[dict[str, Any]] = []
     if result.reasoning:
         output_items.append(
             {
@@ -573,7 +637,9 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
         "input_tokens": _estimate(prepared.prompt),
         "input_tokens_details": {"cached_tokens": 0},
         "output_tokens": _estimate(final_content),
-        "output_tokens_details": {"reasoning_tokens": _estimate(result.reasoning or "")},
+        "output_tokens_details": {
+            "reasoning_tokens": _estimate(result.reasoning or "")
+        },
         "total_tokens": _estimate(prepared.prompt) + _estimate(final_content),
     }
     _store_response_link(response_id, key, spec.wire_id)
@@ -592,7 +658,7 @@ async def _responses_stream(
     include_sources: bool = False,
     hashes: list[str] | None = None,
 ) -> AsyncIterator[str]:
-    def event(name: str, payload: dict) -> str:
+    def event(name: str, payload: dict[str, Any]) -> str:
         payload = {"type": name, **payload}
         return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -603,7 +669,13 @@ async def _responses_stream(
         "response.output_item.added",
         {
             "output_index": 0,
-            "item": {"id": msg_item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
+            "item": {
+                "id": msg_item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
         },
     )
     yield event(
@@ -622,7 +694,11 @@ async def _responses_stream(
     sources: list[dict[str, Any]] = []
     try:
         async for ev in manager().stream_turn(
-            key, prepared, deepthink=spec.deepthink, model_type=spec.model_type, hashes=hashes
+            key,
+            prepared,
+            deepthink=spec.deepthink,
+            model_type=spec.model_type,
+            hashes=hashes,
         ):
             if ev.kind == "reasoning":
                 reasoning_text.append(str(ev.value))
@@ -664,7 +740,12 @@ async def _responses_stream(
         text = "".join(full_text)
         yield event(
             "response.output_text.done",
-            {"item_id": msg_item_id, "output_index": 0, "content_index": 0, "text": text},
+            {
+                "item_id": msg_item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": text,
+            },
         )
         yield event(
             "response.content_part.done",
@@ -684,7 +765,9 @@ async def _responses_stream(
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    "content": [
+                        {"type": "output_text", "text": text, "annotations": []}
+                    ],
                 },
             },
         )
@@ -696,7 +779,9 @@ async def _responses_stream(
                     {
                         "type": "reasoning",
                         "id": f"rs_{uuid.uuid4().hex}",
-                        "summary": [{"type": "summary_text", "text": "".join(reasoning_text)}],
+                        "summary": [
+                            {"type": "summary_text", "text": "".join(reasoning_text)}
+                        ],
                     }
                     if reasoning_text
                     else None
@@ -706,7 +791,9 @@ async def _responses_stream(
                     "type": "message",
                     "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    "content": [
+                        {"type": "output_text", "text": text, "annotations": []}
+                    ],
                 },
             ]
             if item is not None
@@ -716,7 +803,9 @@ async def _responses_stream(
             "input_tokens": _estimate(prepared.prompt),
             "input_tokens_details": {"cached_tokens": 0},
             "output_tokens": _estimate(text),
-            "output_tokens_details": {"reasoning_tokens": _estimate("".join(reasoning_text))},
+            "output_tokens_details": {
+                "reasoning_tokens": _estimate("".join(reasoning_text))
+            },
             "total_tokens": _estimate(prepared.prompt) + _estimate(text),
         }
         _store_response_link(response_id, key, spec.wire_id)
@@ -727,13 +816,13 @@ async def _responses_stream(
         yield event("response.failed", {"response": failed})
 
 
-def _normalize_responses_input(value) -> list[dict]:
+def _normalize_responses_input(value: Any) -> list[dict[str, Any]]:
     """Accept string input or the documented item shapes; flatten to messages."""
     if value is None:
         return []
     if isinstance(value, str):
         return [{"role": "user", "content": value}]
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for item in value if isinstance(value, list) else [value]:
         if isinstance(item, str):
             out.append({"role": "user", "content": item})
@@ -754,16 +843,20 @@ def _normalize_responses_input(value) -> list[dict]:
                 )
             elif itype == "reasoning":
                 summary = "".join(
-                    p.get("text", "") for p in (item.get("summary") or []) if isinstance(p, dict)
+                    p.get("text", "")
+                    for p in (item.get("summary") or [])
+                    if isinstance(p, dict)
                 )
                 if summary:
-                    out.append({"role": "assistant", "content": f"[reasoning] {summary}"})
+                    out.append(
+                        {"role": "assistant", "content": f"[reasoning] {summary}"}
+                    )
             # function_call / tool echoes without output are skipped
     return out
 
 
 _RESPONSE_LINK_MAX = 10_000
-_response_links: "OrderedDict[str, dict]" = OrderedDict()
+_response_links: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
 
 def _store_response_link(response_id: str, conversation_key: str, model: str) -> None:
@@ -810,13 +903,15 @@ async def get_response(response_id: str):
                 "id": f"msg_{response_id[5:]}",
                 "status": "completed",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": last_answer, "annotations": []}],
+                "content": [
+                    {"type": "output_text", "text": last_answer, "annotations": []}
+                ],
             }
         ],
     }
 
 
 @app.delete("/v1/sessions/{key}", dependencies=[Depends(require_api_key)])
-async def delete_session(key: str) -> dict:
+async def delete_session(key: str) -> dict[str, Any]:
     await manager().reset(key)
     return {"status": "deleted", "session": key}
