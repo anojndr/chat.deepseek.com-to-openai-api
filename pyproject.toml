@@ -28,6 +28,7 @@ all = "error"
 [tool.ty.analysis]
 strict-equality-semantics = true
 strict-generic-narrowing = true
+respect-type-ignore-comments = false
 
 [tool.ty.terminal]
 error-on-warning = true
@@ -35,3 +36,4 @@ output-format = "concise"
 
 [tool.ty.environment]
 python-version = "3.12"
+python-platform = "all"

@@ -35,12 +35,8 @@ def _pip_supports(flag: str) -> bool:
 
 
 def ensure_wasmtime() -> None:
-    try:
-        import wasmtime  # noqa: F401
-
+    if _have("wasmtime"):
         return
-    except Exception:
-        pass
     machine = platform.machine().lower()
     if machine not in ("x86_64", "amd64"):
         # vendored wheel is x86_64-only; PyPI publishes aarch64 wheels
