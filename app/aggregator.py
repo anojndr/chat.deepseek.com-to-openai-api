@@ -35,7 +35,9 @@ class FragmentAggregator:
 
     def apply(self, event: str | None, data: Any) -> Iterator[tuple[str, Any]]:
         """Feed one SSE event; yield ('reasoning'|'content'|'search'|'meta', payload)."""
-        if event in ("ready", "update_session"):
+        # update_file arrives on file-ref turns (live 2026-09-11: ready →
+        # update_file → update_session → snapshot → patches); file state only.
+        if event in ("ready", "update_session", "update_file"):
             return
         if event == "title":
             if isinstance(data, dict):
