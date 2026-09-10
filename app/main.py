@@ -175,7 +175,14 @@ async def root() -> dict[str, Any]:
         "status": "ok",
         "service": "chat.deepseek.com → OpenAI-compatible API",
         "endpoints": ["/v1/chat/completions", "/v1/responses", "/v1/models", "/health"],
-        "models": ["deepseek-chat", "deepseek-chat-deepthink", "deepseek-reasoner"],
+        "models": [
+            "deepseek-chat",
+            "deepseek-chat-deepthink",
+            "deepseek-reasoner",
+            "deepseek-reasoner-deepthink",
+            "deepseek-vision",
+            "deepseek-vision-deepthink",
+        ],
     }
 
 

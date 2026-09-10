@@ -214,7 +214,14 @@ class DeepSeekClient:
         *,
         vision: bool = False,
     ) -> str:
-        """Upload a file; when `vision`, fork it so images get parsed for vision."""
+        """Upload a file; `vision` keeps the legacy vision-fork fallback.
+
+        Since the Instant/Expert/Vision unification the backend parses image
+        uploads directly as model_kind VISION, so the fork below is normally
+        skipped (or fails soft with biz_code 2 "model kind satisfied", which
+        is tolerated). It stays as a fallback for backends that still return
+        a non-vision kind for images.
+        """
         headers, _ = await self._get_pow(TARGET_UPLOAD)
         files = {"file": (filename, content, mime or "application/octet-stream")}
         resp = await self._http.post(

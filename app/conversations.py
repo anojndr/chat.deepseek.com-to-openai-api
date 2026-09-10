@@ -274,9 +274,13 @@ class ConversationManager:
                 elif not fresh_session and conv.history and prev_session is None:
                     turn_prepared = self._replay_prompt(conv, prepared)
                 file_ids = await self._upload_files(client, conv, turn_prepared)
-                # explicit caller model wins; auto-select vision only when the
-                # caller left it unspecified but files need vision parsing
-                effective_model = model_type or ("vision" if file_ids else None)
+                # Unified backend: the default entry handles images natively
+                # (uploads arrive as model_kind VISION and every model_type
+                # answers them), so pass the caller's explicit model_type
+                # through unchanged — never auto-switch to "vision" for file
+                # turns. Sessions also pin model_type on their first
+                # completion, so per-turn switching would silently stick to
+                # the first value anyway.
                 result = await self._collect(
                     client,
                     prompt=turn_prepared.prompt,
@@ -284,7 +288,7 @@ class ConversationManager:
                     ref_file_ids=file_ids,
                     thinking_enabled=deepthink,
                     search_enabled=True,
-                    model_type=effective_model,
+                    model_type=model_type,
                 )
                 if not result.content:
                     # refusal / muted / empty stream. Rotate attempts WITHOUT
@@ -406,7 +410,9 @@ class ConversationManager:
             sources_collected: list[dict[str, Any]] = []
             rewriter = CitationRewriter(reference_urls)
             emitted = False
-            effective_model = model_type or ("vision" if file_ids else None)
+            # Unified backend (see _run_turn_locked): pass model_type through
+            # unchanged; the default entry sees images natively and sessions
+            # pin model_type on first use.
             try:
                 async for ev in self._stream_events(
                     client,
@@ -414,7 +420,7 @@ class ConversationManager:
                     conv=conv,
                     ref_file_ids=file_ids,
                     thinking_enabled=deepthink,
-                    model_type=effective_model,
+                    model_type=model_type,
                 ):
                     if ev.kind == "references":
                         reference_urls.extend(

@@ -1,4 +1,13 @@
-"""OpenAI-compatible request/response translation models."""
+"""OpenAI-compatible request/response translation models.
+
+chat.deepseek.com now serves a single unified model behind its Instant /
+Expert / Vision entry points (everyday chat, image understanding, and complex
+problem-solving share one backend). The web wire protocol still accepts only
+`default` / `expert` / `vision` as `model_type`, so this module keeps those
+wire values: `deepseek-chat` (Instant) is the unified default entry, while
+`expert` / `vision` ids remain accepted as explicit routes to the same
+upgraded backend. Thinking is orthogonal via `thinking_enabled`.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +27,11 @@ MODEL_ALIASES = {
     "deepseek-reasoner": None,
     "deepseek-r1": None,
     "default": None,
+    # Web UI names for the unified entries; Instant is the default backend.
+    "instant": None,
+    "deepseek-instant": None,
     "expert": "expert",
+    "deepseek-expert": "expert",
     "deepseek-vision": "vision",
     "vision": "vision",  # legacy alias for deepseek-vision
 }

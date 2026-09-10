@@ -59,11 +59,20 @@ accounts you are willing to lose.
 
 ## Models
 
-- `deepseek-chat` — default (Instant)
-- `deepseek-chat-deepthink` — thinking enabled
-- `deepseek-reasoner` — alias; thinks by default (`deepseek-r1` too)
+chat.deepseek.com now serves one unified model behind its **Instant**,
+**Expert**, and **Vision** entries — everyday chat, image understanding, and
+complex problem-solving share the same upgraded backend. This proxy routes
+everything through that unified backend:
+
+- `deepseek-chat` — default unified entry (Instant). Handles text, files, and
+  images natively; no special model needed for attachments.
+- `deepseek-chat-deepthink` — same, with thinking enabled.
+- `deepseek-reasoner` — alias; thinks by default (`deepseek-r1` too).
+- `deepseek-expert` / `expert` — explicit Expert route to the unified backend.
+- `deepseek-vision` / `vision` — explicit Vision route; still accepted, but no
+  longer required for images (the default entry sees them natively).
+- `deepseek-instant` / `instant` — spelling of the default entry.
 - any model id also accepts `-think`/`-thinking` as the thinking suffix
-- `deepseek-vision[-deepthink]` — DeepSeek Vision; forces `model_type:"vision"` even without attachments (plain `vision` still works as a legacy alias)
 
 Any model id ending in `-deepthink` (or `-think`) enables DeepSeek's thinking
 mode; reasoning streams as `reasoning_content` deltas (Chat) /
@@ -88,9 +97,11 @@ mode; reasoning streams as `reasoning_content` deltas (Chat) /
   `parent_message_id` natively inside DeepSeek. Without the header the key
   derives from client IP + `user`.
 - **Files**: attach via content parts (`image_url`, `file`, `input_file`) with
-  `data:` URLs. Images are fork-parsed for Vision (`model_type:"vision"`);
-  text/code/JSON/PDF etc. use normal parsing. Any extension in DeepSeek's
-  supported list works.
+  `data:` URLs. Images upload as Vision-kind files and are understood by the
+  default unified entry — no `deepseek-vision` needed. An explicit `vision`
+  model still works; the legacy fork-parse is kept only as a tolerated
+  fallback. Text/code/JSON/PDF etc. use normal parsing. Any extension in
+  DeepSeek's supported list works.
 - **Load balancing**: round-robin across every account in `accounts.txt`;
   add as many blocks as you like. Unhealthy accounts (muted, rate-limited,
   network failure, empty stream) get exponential cooldown and traffic rotates

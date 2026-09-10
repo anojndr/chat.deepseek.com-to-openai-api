@@ -11,7 +11,7 @@ Layered: `app/main.py` (routes/SSE) → `app/models.py` + `app/turn.py` (transla
 Normalization: `app/aggregator.py` (`FragmentAggregator`) → `app/citations.py` (`CitationRewriter`); PoW: `app/pow_solver.py`; state: `app/storage.py` (SQLite WAL) + in-memory maps.
 
 Request path:
-`POST /v1/chat/completions|/v1/responses` → `parse_model` + `compute_history_hashes` → session key (`X-Session-Id` header else `find_prefix` longest-prefix lookup, fork-on-mismatch) → `prepare_turn` (first turn: full transcript; later: latest user msg + `parent_message_id`) → `_ensure_session` (reuse pinned session else `AccountPool.acquire` + `create_session`) → `_upload_files` + vision fork → `stream_completion` (fresh PoW per call via `asyncio.to_thread(PowSolver.solve)`, `x-ds-pow-response` header) → `FragmentAggregator.apply` → `CitationRewriter.feed` → `StreamEvent` → SSE (`_chat_stream`/`_responses_stream`) or `TurnResult`.
+`POST /v1/chat/completions|/v1/responses` → `parse_model` + `compute_history_hashes` → session key (`X-Session-Id` header else `find_prefix` longest-prefix lookup, fork-on-mismatch) → `prepare_turn` (first turn: full transcript; later: latest user msg + `parent_message_id`) → `_ensure_session` (reuse pinned session else `AccountPool.acquire` + `create_session`) → `_upload_files` (unified backend: default entry sees images natively, no vision fork) → `stream_completion` (fresh PoW per call via `asyncio.to_thread(PowSolver.solve)`, `x-ds-pow-response` header) → `FragmentAggregator.apply` → `CitationRewriter.feed` → `StreamEvent` → SSE (`_chat_stream`/`_responses_stream`) or `TurnResult`.
 Failover: `DeepSeekError` clears pinned session + `mark_failure` (except `EmptyCompletion`, never poisons health), retry across accounts; mid-stream failure → SSE error payload. TTL sweeper (6h) prunes idle sessions; `delete_session` best-effort.
 
 ## Key Directories
@@ -57,9 +57,9 @@ Env (process env only, no `.env` file): `HOST`, `PORT`, `API_KEY` (unset=open; s
 - `setup.py`: `bootstrap()`/`ensure_wasmtime()` — vendored wheel on x86_64 else PyPI, fail-fast on missing `fastapi/httpx/uvicorn/pydantic`.
 - `app/main.py`: FastAPI app, all routes, SSE emitters, response-link LRU.
 - `app/conversations.py`: orchestration — pinning, failover, replay, history, TTL sweeper.
-- `app/deepseek.py`: `httpx` client — PoW header, session create/delete, upload/vision fork, SSE parser.
+- `app/deepseek.py`: `httpx` client — PoW header, session create/delete, upload (legacy vision-fork fallback), SSE parser.
 - `app/accounts.py`: `AccountPool` round-robin + exp cooldown (cap 900s), `parse_accounts`.
-- `app/models.py`: `parse_model` (deepthink suffixes/aliases/vision), `decode_data_url`, content-part flattening.
+- `app/models.py`: `parse_model` (unified Instant/Expert/Vision aliases + deepthink suffixes), `decode_data_url`, content-part flattening.
 - `app/turn.py`: `prepare_turn`, `compute_history_hashes`/`item_hash` rolling prefix hashes.
 - `app/aggregator.py`: JSON-patch aggregation.
 - `app/citations.py`: citation rewrite + appendix builder.

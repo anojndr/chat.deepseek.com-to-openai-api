@@ -18,6 +18,7 @@ from test_include_sources import (
     ResponsesApiAppendixEndpointTest,
     StreamEventsSourceEmissionTest,
 )
+from test_unified_model import TestUnifiedModel, TestUnifiedFileTurns
 
 
 class TestSQLitePersistence(unittest.TestCase):
