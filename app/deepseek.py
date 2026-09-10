@@ -251,22 +251,45 @@ class DeepSeekClient:
                 )
 
         if vision:
-            # default-model parse of an image ends CONTENT_EMPTY (no text);
-            # that is expected — the vision fork below re-parses it. Wait for
-            # the parse to reach a TERMINAL state before forking.
+            # Default-model parse of an image used to end CONTENT_EMPTY (no text);
+            # the vision fork below then re-parsed it. DeepSeek now uploads images
+            # directly as model_kind VISION, so the fork is a no-op that fails with
+            # biz_code 2 ("model kind satisfied"). Detect that upfront and tolerate
+            # it so image turns don't fail across all accounts.
+            model_kind = biz.get("model_kind")
+            already_vision = (
+                isinstance(model_kind, str) and model_kind.lower() == "vision"
+            )
             st = await wait_terminal(file_id, 30.0)
             if st not in ("SUCCESS", "CONTENT_EMPTY"):
                 raise DeepSeekError(
                     f"initial upload parse failed ({st or 'timed out'})"
                 )
+            if already_vision:
+                # Upload already produced a VISION-kind file; skip the fork.
+                await wait_success(file_id, 40.0)
+                return file_id
 
         if vision:
-            payload = await self._request_json(
-                "POST",
-                "/api/v0/file/fork_file_task",
-                json_body={"file_id": file_id, "to_model_type": "vision"},
-            )
-            forked = self._check_biz(payload, "fork_file_task")
+            try:
+                payload = await self._request_json(
+                    "POST",
+                    "/api/v0/file/fork_file_task",
+                    json_body={"file_id": file_id, "to_model_type": "vision"},
+                )
+            except DeepSeekError as exc:
+                if exc.biz_code == 2 or "model kind satisfied" in str(exc):
+                    # Already a vision file despite model_kind not saying so.
+                    await wait_success(file_id, 40.0)
+                    return file_id
+                raise
+            try:
+                forked = self._check_biz(payload, "fork_file_task")
+            except DeepSeekError as exc:
+                if exc.biz_code == 2 or "model kind satisfied" in str(exc):
+                    await wait_success(file_id, 40.0)
+                    return file_id
+                raise
             new_file = forked.get("file")
             new_id = forked.get("id") or (
                 new_file.get("id") if isinstance(new_file, dict) else None
