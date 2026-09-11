@@ -53,8 +53,7 @@ async def lifespan(_app: FastAPI):
     else:
         _manager.ensure_sweeper()
     yield
-    if _manager is not None:
-        await manager().aclose()
+    await manager().aclose()
 
 
 app = FastAPI(
@@ -279,7 +278,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         is_first = conv.deepseek_session_id is None
     else:
         # Match longest prefix
-        match = _storage.find_prefix(hashes) if _storage is not None else None
+        match = _storage.find_prefix(hashes)
         matched_len = match[0] if match else 0
         ref: ConvRef | None = match[1] if match else None
 
@@ -287,9 +286,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             # Exact duplicate request: re-match at matched_len - 1
             matched_len = len(hashes) - 1
             rematch = (
-                _storage.find_prefix(hashes[:matched_len])
-                if (matched_len > 0 and _storage is not None)
-                else None
+                _storage.find_prefix(hashes[:matched_len]) if matched_len > 0 else None
             )
             ref = rematch[1] if rematch else None
 
@@ -303,6 +300,9 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             conv.account_token = ref.account_token
             conv.deepseek_session_id = ref.deepseek_session_id
             conv.parent_message_id = ref.parent_message_id
+            # Persist the inherited checkpoint now: until the first upstream
+            # event the row otherwise looks brand-new, hiding mid-flight state.
+            manager()._persist_conversation(conv)
             is_first = not is_immediate_parent
         else:
             # Brand new conversation
@@ -512,16 +512,14 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
         is_first = conv.deepseek_session_id is None
     else:
         # Match prefix
-        match = _storage.find_prefix(hashes) if _storage is not None else None
+        match = _storage.find_prefix(hashes)
         matched_len = match[0] if match else 0
         ref: ConvRef | None = match[1] if match else None
 
         if ref is not None and matched_len >= len(hashes):
             matched_len = len(hashes) - 1
             rematch = (
-                _storage.find_prefix(hashes[:matched_len])
-                if (matched_len > 0 and _storage is not None)
-                else None
+                _storage.find_prefix(hashes[:matched_len]) if matched_len > 0 else None
             )
             ref = rematch[1] if rematch else None
 
@@ -533,6 +531,9 @@ async def responses_api(request: Request) -> StreamingResponse | JSONResponse:
             conv.account_token = ref.account_token
             conv.deepseek_session_id = ref.deepseek_session_id
             conv.parent_message_id = ref.parent_message_id
+            # Persist the inherited checkpoint now: until the first upstream
+            # event the row otherwise looks brand-new, hiding mid-flight state.
+            manager()._persist_conversation(conv)
             is_first = not is_immediate_parent
         else:
             key = f"auto:{uuid.uuid4().hex}"

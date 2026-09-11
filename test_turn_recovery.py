@@ -99,7 +99,7 @@ class FakeDeepSeekClient(DeepSeekClient):
         for item in self.script.pop(0):
             if isinstance(item, BaseException):
                 raise item
-            if isinstance(item, dict) and "__hang__" in item:
+            if "__hang__" in item:
                 hang = item["__hang__"]
                 assert isinstance(hang, asyncio.Event)
                 await hang.wait()

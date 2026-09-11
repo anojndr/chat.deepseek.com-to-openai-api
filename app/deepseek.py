@@ -17,6 +17,15 @@ BASE_URL = "https://chat.deepseek.com"
 TARGET_COMPLETION = "/api/v0/chat/completion"
 TARGET_UPLOAD = "/api/v0/file/upload_file"
 
+# Stall watchdog: longest we'll go without usable upstream SSE output, from
+# stream start to first event or between yielded events. httpx's read timeout
+# only trips on total silence and SSE keepalives reset it, so without this a
+# wedged upstream worker holds the turn open forever with zero deltas and the
+# client never gets a terminal event (seen live: a turn parked 13+ min while
+# the UI showed "streaming"). Exceeded -> DeepSeekError, which the caller
+# turns into a terminal failed event / account rotation.
+STALL_TIMEOUT = 90.0
+
 _CLIENT_HEADERS = {
     "x-client-platform": "web",
     "x-client-version": "2.4.0",
@@ -305,7 +314,7 @@ class DeepSeekClient:
                 raise DeepSeekError("fork_file_task response missing new file id")
             file_id = str(new_id)
             # non-vision images are useless without text extraction
-        elif not vision and mime and mime.startswith("image/"):
+        elif mime and mime.startswith("image/"):
             pass  # handled by generic wait below
 
         if vision:
@@ -351,7 +360,28 @@ class DeepSeekClient:
                 )
             event_name: str | None = None
             data_lines: list[str] = []
-            async for line in response.aiter_lines():
+            lines = response.aiter_lines()
+            last_progress = time.monotonic()
+            while True:
+                try:
+                    async with asyncio.timeout(STALL_TIMEOUT):
+                        line = await lines.__anext__()
+                except StopAsyncIteration:
+                    break
+                except TimeoutError as exc:
+                    # Total silence: nothing arrived within the bound.
+                    raise DeepSeekError(
+                        f"completion stalled: no data from upstream for {STALL_TIMEOUT:g}s",
+                        status=response.status_code,
+                    ) from exc
+                if time.monotonic() - last_progress > STALL_TIMEOUT:
+                    # Every received line is bounded here — including bare
+                    # blank lines, which take `continue` below. Lines flowing
+                    # without usable events means a wedged worker.
+                    raise DeepSeekError(
+                        f"completion stalled: no usable events from upstream for {STALL_TIMEOUT:g}s",
+                        status=response.status_code,
+                    )
                 if line == "":
                     if data_lines:
                         raw = "\n".join(data_lines)
@@ -361,6 +391,7 @@ class DeepSeekClient:
                             )
                         except json.JSONDecodeError:
                             payload = {"v": raw}
+                        last_progress = time.monotonic()
                         yield {"event": event_name, "data": payload}
                     event_name = None
                     data_lines = []

@@ -19,6 +19,7 @@ from test_include_sources import (
     StreamEventsSourceEmissionTest,
 )
 from test_unified_model import TestUnifiedModel, TestUnifiedFileTurns
+from test_stream_stall import TestStreamStall
 
 
 class TestSQLitePersistence(unittest.TestCase):
