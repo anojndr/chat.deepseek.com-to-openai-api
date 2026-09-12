@@ -1,55 +1,79 @@
-"""Regression tests: stale parent_message_id / session recovery after a dead stream.
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
+"""Check stale session recovery after dead streams."""
 
-Root cause being guarded: _stream_events/_collect used to record the
-response_message_id only at natural stream end (streaming variant), so a
-stream that died or a cancelled request left parent_message_id pointing at an
-ancestor message. The NEXT turn then appended at the wrong node of the
-DeepSeek session tree and upstream answered the previous topic instead of the
-new prompt.
-"""
+from __future__ import annotations
 
 import asyncio
+import contextlib
 import tempfile
 import time
-from collections.abc import AsyncIterator
+import unittest
 from pathlib import Path
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, Unpack, override
 
 from app.accounts import AccountPool
 from app.conversations import ConversationManager, DeepSeekError
-from app.deepseek import DeepSeekClient
+from app.deepseek import CompletionOptions, DeepSeekClient
 from app.pow_solver import PowSolver
-from app.storage import ConvRef, Storage
+from app.storage import ConversationRow, ConvRef, Storage
 from app.turn import prepare_turn
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from app.turn import PreparedTurn
+
+_RID_FIRST = 101
+_RID_PARTIAL = 202
+_RID_RECOVERED = 303
+_RID_READY = 555
+_TEXT_FIRST = "a1"
+_TEXT_PARTIAL = "par"
+_TEXT_RECOVERED = "a3"
+_TEXT_THIRD = "a3"
+_EXPECTED_CALLS = 3
+_CANCEL_DELAY_S = 0.15
+_COMMIT_DELAY_S = 0.05
+_SLOW_DELAY_S = 0.4
+_COMMIT_TIMEOUT_S = 2.0
+_FAKE_ID = "tok"
+_HANG_KEY = "__hang__"
 
 
 class DummySolver(PowSolver):
-    """Test double that never touches wasm."""
+    """Refuse to solve PoW in tests."""
 
     def __init__(self) -> None:
-        pass
+        """Initialize without wasm."""
 
     @override
     def solve(
         self,
         challenge_hex: str,
         salt: str,
-        expire_at: str | int | float,
-        difficulty: float | int,
+        expire_at: str | float,
+        difficulty: float,
     ) -> int | None:
+        """Return no solution.
+
+        Returns:
+            None: Never solves.
+
+        """
         return None
 
 
 class FakeDeepSeekClient(DeepSeekClient):
-    """Scriptable stand-in for DeepSeekClient."""
+    """Replay scripted stream fragments."""
 
     def __init__(
         self,
         token: str,
         script: list[dict[str, Any] | BaseException] | None = None,
-        pow_solver: PowSolver | None = None,
-        timeout: float = 120.0,
+        _pow_solver: PowSolver | None = None,
+        _timeout: float = 120.0,
     ) -> None:
+        """Store token and script."""
         self.token = token
         self.script: list[list[dict[str, Any] | BaseException]] = (
             [script] if script is not None else []
@@ -59,6 +83,12 @@ class FakeDeepSeekClient(DeepSeekClient):
 
     @override
     async def create_session(self) -> str:
+        """Return canned session id.
+
+        Returns:
+            str: Session id.
+
+        """
         sid = f"s{len(self.sessions) + 1}"
         self.sessions.append(sid)
         return sid
@@ -72,7 +102,14 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         vision: bool = False,
     ) -> str:
-        raise AssertionError("no files expected")
+        """Reject unexpected uploads.
+
+        Raises:
+            AssertionError: Always raised.
+
+        """
+        msg = "no files expected"
+        raise AssertionError(msg)
 
     @override
     async def stream_completion(
@@ -80,12 +117,22 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         prompt: str,
         chat_session_id: str,
-        parent_message_id: int | None = None,
-        ref_file_ids: list[str] | None = None,
-        thinking_enabled: bool = False,
-        search_enabled: bool = True,
-        model_type: str | None = None,
+        **options: Unpack[CompletionOptions],
     ) -> AsyncIterator[dict[str, Any]]:
+        """Replay scripted fragments.
+
+        Yields:
+            dict[str, Any]: Stream event.
+
+        Raises:
+            AssertionError: If hang marker has wrong type.
+
+        """
+        parent_message_id = options.get("parent_message_id")
+        ref_file_ids = options.get("ref_file_ids")
+        thinking_enabled = options.get("thinking_enabled", False)
+        search_enabled = options.get("search_enabled", True)
+        model_type = options.get("model_type")
         self.calls.append(
             {
                 "prompt": prompt,
@@ -95,29 +142,36 @@ class FakeDeepSeekClient(DeepSeekClient):
                 "thinking_enabled": thinking_enabled,
                 "search_enabled": search_enabled,
                 "model_type": model_type,
-            }
+            },
         )
         for item in self.script.pop(0):
             if isinstance(item, BaseException):
                 raise item
-            if "__hang__" in item:
-                hang = item["__hang__"]
-                assert isinstance(hang, asyncio.Event)
+            if _HANG_KEY in item:
+                hang = item[_HANG_KEY]
+                if not isinstance(hang, asyncio.Event):
+                    msg = "hang marker must be Event"
+                    raise AssertionError(msg)
                 await hang.wait()
                 continue
             yield item
 
     @override
     async def aclose(self) -> None:
-        pass
+        """Close without action."""
 
     @override
     async def delete_session(self, session_id: str) -> None:
-        pass
+        """Delete without action."""
 
 
-def _turn(rid: int, text: str):
-    """ready + RESPONSE fragment + one implicit content delta."""
+def _turn(rid: int, text: str) -> list[dict[str, Any] | BaseException]:
+    """Build ready plus fragment events.
+
+    Returns:
+        list[dict[str, Any] | BaseException]: Stream script.
+
+    """
     return [
         {"event": "ready", "data": {"response_message_id": rid}},
         {
@@ -132,280 +186,431 @@ def _turn(rid: int, text: str):
     ]
 
 
-def _ready_ok():
-    return _turn(101, "a1")
+def _ready_ok() -> list[dict[str, Any] | BaseException]:
+    """Build healthy first turn script.
+
+    Returns:
+        list[dict[str, Any] | BaseException]: Stream script.
+
+    """
+    return _turn(_RID_FIRST, _TEXT_FIRST)
 
 
-def _ready2_then_die():
-    return [*_turn(202, "par"), RuntimeError("upstream connection reset")]
+def _ready2_then_die() -> list[dict[str, Any] | BaseException]:
+    """Build partial turn that dies midstream.
+
+    Returns:
+        list[dict[str, Any] | BaseException]: Stream script.
+
+    """
+    return [*_turn(_RID_PARTIAL, _TEXT_PARTIAL), RuntimeError("upstream reset")]
 
 
-def _ready3_ok():
-    return _turn(303, "a3")
+def _ready3_ok() -> list[dict[str, Any] | BaseException]:
+    """Build healthy recovery script.
+
+    Returns:
+        list[dict[str, Any] | BaseException]: Stream script.
+
+    """
+    return _turn(_RID_RECOVERED, _TEXT_RECOVERED)
 
 
-def _make_manager(tmpdir: str) -> tuple[ConversationManager, FakeDeepSeekClient]:
+def _make_manager(
+    tmpdir: str,
+) -> tuple[ConversationManager, FakeDeepSeekClient, Storage, AccountPool]:
+    """Build manager with fake client.
+
+    Returns:
+        tuple[ConversationManager, FakeDeepSeekClient, Storage, AccountPool]:
+            Manager, client, storage, and pool.
+
+    """
     db_path = Path(tmpdir) / "t.sqlite"
     accounts_path = Path(tmpdir) / "accounts.txt"
     accounts_path.write_text('account 1\n{"userToken": "tok"}')
+    pool = AccountPool(accounts_path)
+    storage = Storage(db_path)
+    mgr = ConversationManager(pool, DummySolver(), storage=storage)
+    client = FakeDeepSeekClient(_FAKE_ID)
 
-    mgr = ConversationManager(
-        AccountPool(accounts_path), DummySolver(), storage=Storage(db_path)
-    )
-    client = FakeDeepSeekClient("tok")
-    mgr._clients["tok"] = client
-    return mgr, client
+    mgr.__dict__["_clients"] = {_FAKE_ID: client}
+    return mgr, client, storage, pool
 
 
-def _prepared(text: str):
+def _prepared(text: str) -> PreparedTurn:
+    """Build followup turn fixture.
+
+    Returns:
+        PreparedTurn: Prepared turn.
+
+    """
     return prepare_turn([{"role": "user", "content": text}], is_first_turn=False)
 
 
-async def test_midstream_failure_recovers_with_full_replay():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
+def _check_equal(actual: object, expected: object, label: str) -> None:
+    """Require values to match.
 
-        # Turn 1: healthy - establishes session s1 + history.
-        client.script.append(_ready_ok())
-        result = await mgr.run_turn(
-            "k", _prepared("q1"), deepthink=False, model_type=None
-        )
-        assert result.content == "a1"
-        conv = await mgr.get_or_create("k")
-        assert conv.deepseek_session_id == "s1"
-        assert conv.parent_message_id == 101
-        assert client.calls[-1]["chat_session_id"] == "s1"
+    Raises:
+        AssertionError: If values differ.
 
-        # Turn 2: upstream commits message 202, then the stream dies mid-answer.
-        # Two scripts: single-account turns now retry once, so both attempts
-        # must die for the turn itself to fail.
-        client.script.append(_ready2_then_die())
-        client.script.append(_ready2_then_die())
-        try:
-            await mgr.run_turn("k", _prepared("q2"), deepthink=False, model_type=None)
-            raise AssertionError("expected DeepSeekError")
-        except DeepSeekError:
-            pass
-
-        # The committed-but-unrecorded turn must NOT stay pinned: dropping the
-        # session (and persisting that!) forces a clean replay next turn,
-        # otherwise the next turn branches at ancestor 101/202 and upstream
-        # answers the wrong thread entirely.
-        stored = storage_check(mgr, "k")
-        assert stored["deepseek_session_id"] is None, stored
-        assert stored["parent_message_id"] is None, stored
-
-        # Turn 3: healthy again - must replay FULL proxy history into the new
-        # session (q1/a1 present, broken q2 absent) instead of a bare prompt.
-        client.script.append(_ready3_ok())
-        await mgr.run_turn("k", _prepared("q3"), deepthink=False, model_type=None)
-        replay_call = client.calls[-1]
-        assert replay_call["chat_session_id"] == "s3"
-        prompt = replay_call["prompt"]
-        assert "[user] q1" in prompt and "[assistant] a1" in prompt, prompt[:500]
-        assert "q2" not in prompt, "failed turn leaked into history"
-        assert prompt.rstrip().endswith("q3")
-        assert replay_call["parent_message_id"] is None
-
-        conv = await mgr.get_or_create("k")
-        assert conv.parent_message_id == 303
-        await mgr.aclose()
+    """
+    if actual != expected:
+        msg = f"{label}: {actual!r} != {expected!r}"
+        raise AssertionError(msg)
 
 
-def storage_check(mgr: ConversationManager, key: str) -> dict[str, Any]:
-    assert mgr._storage is not None
-    data = mgr._storage.get_conversation(key)
-    assert data is not None
+def _check_is_none(value: object, label: str) -> None:
+    """Require value to be None.
+
+    Raises:
+        AssertionError: If value is not None.
+
+    """
+    if value is not None:
+        msg = f"{label}: {value!r} is not None"
+        raise AssertionError(msg)
+
+
+def _check_contains(haystack: str, needle: str, label: str) -> None:
+    """Require substring present.
+
+    Raises:
+        AssertionError: If needle missing.
+
+    """
+    if needle not in haystack:
+        msg = f"{label}: {needle!r} missing"
+        raise AssertionError(msg)
+
+
+def _check_absent(haystack: str, needle: str, label: str) -> None:
+    """Require substring absent.
+
+    Raises:
+        AssertionError: If needle present.
+
+    """
+    if needle in haystack:
+        msg = f"{label}: {needle!r} should be absent"
+        raise AssertionError(msg)
+
+
+def storage_check(storage: Storage, key: str) -> ConversationRow:
+    """Fetch stored conversation row.
+
+    Returns:
+        ConversationRow: Stored row.
+
+    Raises:
+        AssertionError: If row missing.
+
+    """
+    data = storage.get_conversation(key)
+    if data is None:
+        msg = f"missing row for {key}"
+        raise AssertionError(msg)
     return data
 
 
-async def test_cancelled_stream_drops_session():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
+async def test_midstream_failure_recovers_with_full_replay() -> None:
+    """Check midstream failure replays full history.
 
+    Raises:
+        AssertionError: If recovery mismatches.
+        TypeError: If prompt shape is invalid.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client, storage, _pool = _make_manager(tmpdir)
+        client.script.append(_ready_ok())
+        result = await mgr.run_turn(
+            "k",
+            _prepared("q1"),
+            deepthink=False,
+            model_type=None,
+        )
+        _check_equal(result.content, _TEXT_FIRST, "content")
+        conv = await mgr.get_or_create("k")
+        _check_equal(conv.deepseek_session_id, "s1", "session")
+        _check_equal(conv.parent_message_id, _RID_FIRST, "parent")
+        _check_equal(client.calls[-1]["chat_session_id"], "s1", "call session")
+        client.script.append(_ready2_then_die())
+        client.script.append(_ready2_then_die())
+        with contextlib.suppress(DeepSeekError):
+            await mgr.run_turn(
+                "k",
+                _prepared("q2"),
+                deepthink=False,
+                model_type=None,
+            )
+            msg = "expected DeepSeekError"
+            raise AssertionError(msg)
+        stored = storage_check(storage, "k")
+        _check_is_none(stored["deepseek_session_id"], "session")
+        _check_is_none(stored["parent_message_id"], "parent")
+        client.script.append(_ready3_ok())
+        await mgr.run_turn("k", _prepared("q3"), deepthink=False, model_type=None)
+        replay_call = client.calls[-1]
+        _check_equal(replay_call["chat_session_id"], "s3", "replay session")
+        prompt = replay_call["prompt"]
+        if not isinstance(prompt, str):
+            msg = "prompt must be str"
+            raise TypeError(msg)
+        _check_contains(prompt, "[user] q1", "replay q1")
+        _check_contains(prompt, "[assistant] a1", "replay a1")
+        _check_absent(prompt, "q2", "replay q2")
+        if not prompt.rstrip().endswith("q3"):
+            msg = "replay should end with q3"
+            raise AssertionError(msg)
+        _check_is_none(replay_call["parent_message_id"], "replay parent")
+        conv = await mgr.get_or_create("k")
+        _check_equal(conv.parent_message_id, _RID_RECOVERED, "recovered parent")
+        await mgr.aclose()
+
+
+async def test_cancelled_stream_drops_session() -> None:
+    """Check cancelled stream drops session."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client, storage, _pool = _make_manager(tmpdir)
         client.script.append(_ready_ok())
         await mgr.run_turn("k2", _prepared("q1"), deepthink=False, model_type=None)
-        assert (await mgr.get_or_create("k2")).deepseek_session_id == "s1"
-
-        # Turn 2 hangs forever after the ready event (client disconnect shape).
+        _check_equal(
+            (await mgr.get_or_create("k2")).deepseek_session_id,
+            "s1",
+            "session",
+        )
         client.script.append(
             [
-                {"event": "ready", "data": {"response_message_id": 202}},
-                {"__hang__": asyncio.Event()},
-            ]
+                {"event": "ready", "data": {"response_message_id": _RID_PARTIAL}},
+                {_HANG_KEY: asyncio.Event()},
+            ],
         )
 
-        async def consume():
+        async def consume() -> None:
+            """Consume stream without action."""
             async for _ev in mgr.stream_turn(
-                "k2", _prepared("q2"), deepthink=False, model_type=None
+                "k2",
+                _prepared("q2"),
+                deepthink=False,
+                model_type=None,
             ):
                 pass
 
         task = asyncio.create_task(consume())
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(_CANCEL_DELAY_S)
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
-
-        stored = storage_check(mgr, "k2")
-        assert stored["deepseek_session_id"] is None, stored
-        assert stored["parent_message_id"] is None, stored
+        stored = storage_check(storage, "k2")
+        _check_is_none(stored["deepseek_session_id"], "session")
+        _check_is_none(stored["parent_message_id"], "parent")
         await mgr.aclose()
 
 
-async def test_ready_persisted_before_stream_finishes():
-    """The rid must land in storage the moment upstream commits the slot."""
+async def test_ready_persisted_before_stream_finishes() -> None:
+    """Check ready id persists before stream ends."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, _client = _make_manager(tmpdir)
-
+        mgr, _client, storage, _pool = _make_manager(tmpdir)
         committed = asyncio.Event()
 
         class SlowClient(FakeDeepSeekClient):
+            """Hang after ready event."""
+
             @override
             async def stream_completion(
                 self,
                 *,
                 prompt: str,
                 chat_session_id: str,
-                parent_message_id: int | None = None,
-                ref_file_ids: list[str] | None = None,
-                thinking_enabled: bool = False,
-                search_enabled: bool = True,
-                model_type: str | None = None,
+                **options: Unpack[CompletionOptions],
             ) -> AsyncIterator[dict[str, Any]]:
+                """Yield ready then hang.
+
+                Yields:
+                    dict[str, Any]: Stream event.
+
+                Raises:
+                    RuntimeError: After ready event.
+
+                """
+                parent_message_id = options.get("parent_message_id")
                 self.calls.append(
                     {
                         "prompt": prompt,
                         "chat_session_id": chat_session_id,
                         "parent_message_id": parent_message_id,
-                    }
+                    },
                 )
-                yield {"event": "ready", "data": {"response_message_id": 555}}
+                yield {"event": "ready", "data": {"response_message_id": _RID_READY}}
                 committed.set()
-                await asyncio.sleep(0.4)
-                raise RuntimeError("boom")
+                await asyncio.sleep(_SLOW_DELAY_S)
+                boom = "boom"
+                raise RuntimeError(boom)
 
-        slow = SlowClient("tok")
-        mgr._clients["tok"] = slow
+        slow = SlowClient(_FAKE_ID)
 
-        async def burn():
-            try:
+        mgr.__dict__["_clients"] = {_FAKE_ID: slow}
+
+        async def burn() -> None:
+            """Run turn that fails."""
+            with contextlib.suppress(Exception):
                 await mgr.run_turn(
-                    "k3", _prepared("q"), deepthink=False, model_type=None
+                    "k3",
+                    _prepared("q"),
+                    deepthink=False,
+                    model_type=None,
                 )
-            except Exception:
-                pass
 
         task = asyncio.create_task(burn())
         try:
-            await asyncio.wait_for(committed.wait(), timeout=2)
-            await asyncio.sleep(0.05)
-            # rid durable BEFORE completion finished:
-            assert storage_check(mgr, "k3")["parent_message_id"] == 555
+            await asyncio.wait_for(committed.wait(), timeout=_COMMIT_TIMEOUT_S)
+            await asyncio.sleep(_COMMIT_DELAY_S)
+            _check_equal(
+                storage_check(storage, "k3")["parent_message_id"],
+                _RID_READY,
+                "ready",
+            )
         finally:
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
-            except asyncio.CancelledError:
-                pass
         await mgr.aclose()
 
 
-async def test_single_account_retries_empty_then_replays():
-    """One account must still retry: bare follow-up goes empty, replay succeeds.
+async def test_single_account_retries_empty_then_replays() -> None:
+    """Check empty first attempt retries with replay.
 
-    Guards the 9:29 PHT incident (short "Cost?" follow-up failed on its only
-    attempt with history=[] left behind). First attempt sends the bare prompt
-    on the inherited session and gets no RESPONSE fragment; the retry must
-    use a fresh session with the full transcript replayed.
+    Raises:
+        AssertionError: If retry mismatches.
+        TypeError: If prompt shape is invalid.
+
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
-        assert mgr._pool.size == 1
-
+        mgr, client, storage, pool = _make_manager(tmpdir)
+        _check_equal(pool.size, 1, "pool size")
         client.script.append(_ready_ok())
         result = await mgr.run_turn(
-            "kr", _prepared("q1"), deepthink=False, model_type=None
+            "kr",
+            _prepared("q1"),
+            deepthink=False,
+            model_type=None,
         )
-        assert result.content == "a1"
-
-        # First attempt: empty stream (no RESPONSE fragment). Second: healthy.
+        _check_equal(result.content, _TEXT_FIRST, "content")
         client.script.append([])
-        client.script.append(_turn(303, "a3"))
+        client.script.append(_turn(_RID_RECOVERED, _TEXT_THIRD))
         result2 = await mgr.run_turn(
-            "kr", _prepared("Cost?"), deepthink=False, model_type=None
+            "kr",
+            _prepared("Cost?"),
+            deepthink=False,
+            model_type=None,
         )
-        assert result2.content == "a3"
-        assert len(client.calls) == 3, client.calls
+        _check_equal(result2.content, _TEXT_THIRD, "retry content")
+        _check_equal(len(client.calls), _EXPECTED_CALLS, "calls")
         replay_prompt = client.calls[-1]["prompt"]
-        assert "[user] q1" in replay_prompt and "[assistant] a1" in replay_prompt
-        assert replay_prompt.rstrip().endswith("Cost?")
-        stored = storage_check(mgr, "kr")
-        assert stored["deepseek_session_id"] == "s2", stored
-        assert stored["parent_message_id"] == 303, stored
+        if not isinstance(replay_prompt, str):
+            msg = "prompt must be str"
+            raise TypeError(msg)
+        _check_contains(replay_prompt, "[user] q1", "replay q1")
+        _check_contains(replay_prompt, "[assistant] a1", "replay a1")
+        if not replay_prompt.rstrip().endswith("Cost?"):
+            msg = "replay should end with Cost?"
+            raise AssertionError(msg)
+        stored = storage_check(storage, "kr")
+        _check_equal(stored["deepseek_session_id"], "s2", "session")
+        _check_equal(stored["parent_message_id"], _RID_RECOVERED, "parent")
         await mgr.aclose()
 
 
-async def test_stream_single_account_retries_empty():
-    """Streaming variant: pre-emit empty completion retries on fresh session."""
+async def test_stream_single_account_retries_empty() -> None:
+    """Check streaming empty attempt retries.
+
+    Raises:
+        AssertionError: If retry mismatches.
+        TypeError: If prompt shape is invalid.
+
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
-        assert mgr._pool.size == 1
+        mgr, client, storage, pool = _make_manager(tmpdir)
+        _check_equal(pool.size, 1, "pool size")
         client.script.append(_ready_ok())
         await mgr.run_turn("ks", _prepared("q1"), deepthink=False, model_type=None)
-
         client.script.append([])
-        client.script.append(_turn(303, "a3"))
-        seen: list[str] = []
-        async for ev in mgr.stream_turn(
-            "ks", _prepared("Cost?"), deepthink=False, model_type=None
-        ):
-            if ev.kind == "content":
-                seen.append(str(ev.value))
-        assert "".join(seen) == "a3", seen
-        assert len(client.calls) == 3, client.calls
+        client.script.append(_turn(_RID_RECOVERED, _TEXT_THIRD))
+        seen = [
+            str(ev.value)
+            async for ev in mgr.stream_turn(
+                "ks",
+                _prepared("Cost?"),
+                deepthink=False,
+                model_type=None,
+            )
+            if ev.kind == "content"
+        ]
+        _check_equal("".join(seen), _TEXT_THIRD, "streamed")
+        _check_equal(len(client.calls), _EXPECTED_CALLS, "calls")
         replay_prompt = client.calls[-1]["prompt"]
-        assert "[user] q1" in replay_prompt and "[assistant] a1" in replay_prompt
-        assert replay_prompt.rstrip().endswith("Cost?")
-        stored = storage_check(mgr, "ks")
-        assert stored["deepseek_session_id"] == "s2", stored
-        assert stored["parent_message_id"] == 303, stored
+        if not isinstance(replay_prompt, str):
+            msg = "prompt must be str"
+            raise TypeError(msg)
+        _check_contains(replay_prompt, "[user] q1", "replay q1")
+        _check_contains(replay_prompt, "[assistant] a1", "replay a1")
+        if not replay_prompt.rstrip().endswith("Cost?"):
+            msg = "replay should end with Cost?"
+            raise AssertionError(msg)
+        stored = storage_check(storage, "ks")
+        _check_equal(stored["deepseek_session_id"], "s2", "session")
+        _check_equal(stored["parent_message_id"], _RID_RECOVERED, "parent")
         await mgr.aclose()
 
 
-async def test_failed_empty_conversation_leaves_no_row():
-    """A key that never records a turn must not leave a history=[] row."""
+async def test_failed_empty_conversation_leaves_no_row() -> None:
+    """Check failed empty conversation leaves no row.
+
+    Raises:
+        AssertionError: If junk row remains.
+
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
+        mgr, client, storage, _pool = _make_manager(tmpdir)
         client.script.append([DeepSeekError("boom", status=502)])
         client.script.append([DeepSeekError("boom again", status=502)])
-        try:
+        with contextlib.suppress(DeepSeekError):
             await mgr.run_turn(
-                "kjunk", _prepared("Cost?"), deepthink=False, model_type=None
+                "kjunk",
+                _prepared("Cost?"),
+                deepthink=False,
+                model_type=None,
             )
-            raise AssertionError("expected DeepSeekError")
-        except DeepSeekError:
-            pass
-        assert mgr._storage is not None
-        assert mgr._storage.get_conversation("kjunk") is None
-        assert "kjunk" not in mgr._conversations
+            msg = "expected DeepSeekError"
+            raise AssertionError(msg)
+        if storage.get_conversation("kjunk") is not None:
+            msg = "junk row should be absent"
+            raise AssertionError(msg)
+        _check_equal(mgr.transcript("kjunk"), [], "transcript")
         await mgr.aclose()
 
 
-async def test_failure_invalidates_stale_prefix_refs():
-    """Prefix rows for a dead session must not resurrect it for the next key."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr, client = _make_manager(tmpdir)
-        assert mgr._storage is not None
+async def test_failure_invalidates_stale_prefix_refs() -> None:
+    """Check dead session prefixes are invalidated.
 
+    Raises:
+        AssertionError: If prefixes survive.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client, storage, _pool = _make_manager(tmpdir)
+        if storage.get_conversation("missing") is not None:
+            msg = "missing key should be absent"
+            raise AssertionError(msg)
         client.script.append(_ready_ok())
         await mgr.run_turn("kp", _prepared("q1"), deepthink=False, model_type=None)
         conv = await mgr.get_or_create("kp")
         dead = conv.deepseek_session_id
-        assert dead is not None
-        mgr._storage.record_prefix_turn(
+        if dead is None:
+            msg = "session should exist"
+            raise AssertionError(msg)
+        storage.record_prefix_turn(
             ["hash-dead-follow"],
             ConvRef(
                 conversation_key="kp",
@@ -417,17 +622,23 @@ async def test_failure_invalidates_stale_prefix_refs():
                 updated_at=time.time(),
             ),
         )
-        assert mgr._storage.find_prefix(["hash-dead-follow"]) is not None
-
+        if storage.find_prefix(["hash-dead-follow"]) is None:
+            msg = "prefix should exist"
+            raise AssertionError(msg)
         client.script.append([DeepSeekError("session gone", status=502)])
-        client.script.append(_turn(303, "recovered"))
+        client.script.append(_turn(_RID_RECOVERED, "recovered"))
         result = await mgr.run_turn(
-            "kp", _prepared("q2"), deepthink=False, model_type=None
+            "kp",
+            _prepared("q2"),
+            deepthink=False,
+            model_type=None,
         )
-        assert result.content == "recovered"
-        conn = mgr._storage._get_conn()
-        left = conn.execute(
-            "SELECT COUNT(*) FROM prefixes WHERE deepseek_session_id = ?", (dead,)
-        ).fetchone()[0]
-        assert left == 0, left
+        _check_equal(result.content, "recovered", "content")
+        if storage.find_prefix(["hash-dead-follow"]) is not None:
+            msg = "dead prefix should be gone"
+            raise AssertionError(msg)
         await mgr.aclose()
+
+
+if __name__ == "__main__":
+    unittest.main()

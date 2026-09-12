@@ -37,3 +37,13 @@ output-format = "concise"
 [tool.ty.environment]
 python-version = "3.12"
 python-platform = "all"
+[tool.ruff]
+preview = true
+target-version = "py312"
+
+[tool.ruff.lint]
+preview = true
+select = ["ALL"]
+
+[tool.ruff.format]
+preview = true

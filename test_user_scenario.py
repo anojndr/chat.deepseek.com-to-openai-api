@@ -1,50 +1,88 @@
-"""Regression tests: Verify tree branching and new chat isolation matching the reported user issue."""
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
+"""Check branching and isolation for user scenario."""
 
 from __future__ import annotations
 
 import tempfile
 import unittest
-from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, Unpack, override
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+import app.main as main_mod
 from app.accounts import AccountPool
+from app.citations import CitationRewriter, rewrite_citations
 from app.conversations import ConversationManager
-from app.deepseek import DeepSeekClient
+from app.deepseek import CompletionOptions, DeepSeekClient
 from app.pow_solver import PowSolver
 from app.storage import Storage
-import app.main as main_mod
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+_FAKE_ACCOUNT_ID = "test_tok_1"
+_HTTP_OK = 200
+_PARENT_FIRST = 101
+_PARENT_SECOND = 102
+_REMEMBER_PARENT = 103
+_BASE_PARENT = 100
+_TEST_FILE_ID = "file_123"
+_MODEL_CHAT = "deepseek-chat"
+_ENDPOINT = "/v1/chat/completions"
+_NAME_AGAIN_PROMPT = "what is my name again? Answer in one sentence only."
+_REMEMBER_PROMPT = (
+    'remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.'
+)
+_STRING_AGAIN_PROMPT = "what string did i ask you to remember again?"
 
 
 class DummySolver(PowSolver):
-    """Test double that never touches wasm."""
+    """Refuse to solve PoW in tests."""
 
     def __init__(self) -> None:
-        pass
+        """Initialize without wasm."""
 
     @override
     def solve(
         self,
         challenge_hex: str,
         salt: str,
-        expire_at: str | int | float,
-        difficulty: float | int,
+        expire_at: str | float,
+        difficulty: float,
     ) -> int | None:
+        """Return no solution.
+
+        Returns:
+            None: Never solves.
+
+        """
         return None
 
 
 class FakeDeepSeekClient(DeepSeekClient):
+    """Replay canned answers keyed by prompt."""
+
     def __init__(
-        self, token: str, pow_solver: PowSolver | None = None, timeout: float = 120.0
+        self,
+        token: str,
+        _pow_solver: PowSolver | None = None,
+        _timeout: float = 120.0,
     ) -> None:
+        """Store token and call log."""
         self.token = token
         self.created_sessions: list[str] = []
         self.recorded_calls: list[dict[str, Any]] = []
 
     @override
     async def create_session(self) -> str:
+        """Return canned session id.
+
+        Returns:
+            str: Session id.
+
+        """
         sid = f"sess_{len(self.created_sessions) + 1}"
         self.created_sessions.append(sid)
         return sid
@@ -58,7 +96,13 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         vision: bool = False,
     ) -> str:
-        return "file_123"
+        """Return canned file id.
+
+        Returns:
+            str: File id.
+
+        """
+        return _TEST_FILE_ID
 
     @override
     async def stream_completion(
@@ -66,41 +110,24 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         prompt: str,
         chat_session_id: str,
-        parent_message_id: int | None = None,
-        ref_file_ids: list[str] | None = None,
-        thinking_enabled: bool = False,
-        search_enabled: bool = True,
-        model_type: str | None = None,
+        **options: Unpack[CompletionOptions],
     ) -> AsyncIterator[dict[str, Any]]:
+        """Replay canned answer.
+
+        Yields:
+            dict[str, Any]: Stream event.
+
+        """
+        parent_message_id = options.get("parent_message_id")
         self.recorded_calls.append(
             {
                 "prompt": prompt,
                 "chat_session_id": chat_session_id,
                 "parent_message_id": parent_message_id,
-            }
+            },
         )
-        # Simulate DeepSeek server message id assignment
-        # If parent_message_id is None, it's root (msg 101, reply 102)
-        # If parent_message_id is 102, reply is 104, etc.
-        rid = (parent_message_id or 100) + 1
-
-        if "My name is Petrig" in prompt:
-            ans = "Your name is Petrig."
-        elif "remember the string `*h#n3XBe8Y$SjJ92y4FX`" in prompt:
-            ans = "understood"
-        elif "what is my name again?" in prompt:
-            if parent_message_id:
-                ans = "Your name is Petrig."
-            else:
-                ans = "I don't know your name."
-        elif "what string did i ask you to remember again?" in prompt:
-            if parent_message_id == 103:
-                ans = "You asked me to remember: `*h#n3XBe8Y$SjJ92y4FX`"
-            else:
-                ans = "You haven't asked me to remember any string."
-        else:
-            ans = f"Reply to {prompt[:20]}"
-
+        rid = (parent_message_id or _BASE_PARENT) + 1
+        ans = _answer_for(prompt, parent_message_id)
         yield {"event": "ready", "data": {"response_message_id": rid}}
         yield {
             "event": None,
@@ -114,183 +141,294 @@ class FakeDeepSeekClient(DeepSeekClient):
 
     @override
     async def aclose(self) -> None:
-        pass
+        """Close without action."""
 
     @override
     async def delete_session(self, session_id: str) -> None:
-        pass
+        """Delete without action."""
+
+
+def _answer_for(prompt: str, parent_message_id: int | None) -> str:
+    """Select canned answer for prompt.
+
+    Returns:
+        str: Canned answer.
+
+    """
+    if "My name is Petrig" in prompt:
+        return "Your name is Petrig."
+    if "remember the string" in prompt:
+        return "understood"
+    return _answer_followup(prompt, parent_message_id)
+
+
+def _answer_followup(prompt: str, parent_message_id: int | None) -> str:
+    """Select followup answer.
+
+    Returns:
+        str: Canned answer.
+
+    """
+    if "what is my name again?" in prompt:
+        if parent_message_id:
+            return "Your name is Petrig."
+        return "I don't know your name."
+    if "what string did i ask you to remember again?" in prompt:
+        if parent_message_id == _REMEMBER_PARENT:
+            return "You asked me to remember: `*h#n3XBe8Y$SjJ92y4FX`"
+        return "You haven't asked me to remember any string."
+    return f"Reply to {prompt[:20]}"
+
+
+def _check_equal(actual: object, expected: object, label: str) -> None:
+    """Require values to match.
+
+    Raises:
+        AssertionError: If values differ.
+
+    """
+    if actual != expected:
+        msg = f"{label}: {actual!r} != {expected!r}"
+        raise AssertionError(msg)
+
+
+def _check_is_none(value: object, label: str) -> None:
+    """Require value to be None.
+
+    Raises:
+        AssertionError: If value is not None.
+
+    """
+    if value is not None:
+        msg = f"{label}: {value!r} is not None"
+        raise AssertionError(msg)
+
+
+def _check_contains(haystack: str, needle: str, label: str) -> None:
+    """Require substring present.
+
+    Raises:
+        AssertionError: If needle missing.
+
+    """
+    if needle not in haystack:
+        msg = f"{label}: {needle!r} missing"
+        raise AssertionError(msg)
+
+
+def _check_absent(haystack: str, needle: str, label: str) -> None:
+    """Require substring absent.
+
+    Raises:
+        AssertionError: If needle present.
+
+    """
+    if needle in haystack:
+        msg = f"{label}: {needle!r} should be absent"
+        raise AssertionError(msg)
 
 
 class TestUserScenario(unittest.TestCase):
-    def test_space_before_punctuation_and_citations(self):
-        from app.citations import CitationRewriter, rewrite_citations
+    """Verify branching and new chat isolation."""
 
-        # 1. Non-streaming space-before-period fix
+    @override
+    def setUp(self) -> None:
+        """Create manager and test client."""
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmpdir.name) / "test_data.sqlite"
+        self.accounts_path = Path(self.tmpdir.name) / "accounts.txt"
+        self.accounts_path.write_text('account 1\n{"userToken": "test_tok_1"}')
+        self.storage = Storage(self.db_path)
+        self.pool = AccountPool(self.accounts_path)
+        self.manager = ConversationManager(
+            self.pool,
+            DummySolver(),
+            storage=self.storage,
+        )
+        self.fake_client = FakeDeepSeekClient(_FAKE_ACCOUNT_ID)
+        patch.object(
+            self.manager,
+            "client_for",
+            return_value=self.fake_client,
+        ).start()
+        self.addCleanup(patch.stopall)
+        patch.object(main_mod, "_storage", self.storage).start()
+        patch.object(main_mod, "_pool", self.pool).start()
+        patch.object(main_mod, "_solver", DummySolver()).start()
+        patch.object(main_mod, "_manager", self.manager).start()
+        self.client = TestClient(main_mod.app)
+
+    @override
+    def tearDown(self) -> None:
+        """Cleanup temp dir."""
+        self.tmpdir.cleanup()
+
+    @staticmethod
+    def test_space_before_punctuation_and_citations() -> None:
+        """Check citation rewrite spacing."""
         raw_text = (
-            "This girl is **Hina Yumihara** from the 2014 mecha anime **Buddy Complex** .\n\n"
-            "### 🎬 Series Details\n\n"
-            "*   **Character Role**: A transfer student who is secretly a time traveler and pilot from the future .\n"
+            "This girl is **Hina Yumihara** from the 2014 mecha "
+            "anime **Buddy Complex** .\n\n"
+            "### Series Details\n\n"
+            "*   **Character Role**: A transfer student who is secretly "
+            "a time traveler and pilot from the future .\n"
             "*   **Studio**: Sunrise .\n"
-            "*   **Plot Summary**: High school student Aoba Watase is thrust into a future war after being saved by Hina, and the series follows his journey piloting a giant robot ."
+            "*   **Plot Summary**: High school student Aoba Watase is "
+            "thrust into a future war after being saved by Hina, "
+            "and the series follows his journey piloting a giant robot ."
         )
         cleaned = rewrite_citations(raw_text, [])
-        self.assertNotIn(" .", cleaned)
-        self.assertIn("**Buddy Complex**.", cleaned)
-        self.assertIn("Sunrise.", cleaned)
-        self.assertIn("giant robot.", cleaned)
-
-        # 2. Vision [!citation:N] markers linking
+        _check_absent(cleaned, " .", "cleaned")
+        _check_contains(cleaned, "**Buddy Complex**.", "complex")
+        _check_contains(cleaned, "Sunrise.", "studio")
+        _check_contains(cleaned, "giant robot.", "robot")
         raw_cite = "From the anime **Buddy Complex** [!citation:1][!citation:2]."
         rewritten = rewrite_citations(
-            raw_cite, ["https://example.com/1", "https://example.com/2"]
+            raw_cite,
+            ["https://example.com/1", "https://example.com/2"],
         )
-        self.assertEqual(
+        _check_equal(
             rewritten,
-            "From the anime **Buddy Complex** [citation:1](https://example.com/1) [citation:2](https://example.com/2).",
+            "From the anime **Buddy Complex** "
+            "[citation:1](https://example.com/1) "
+            "[citation:2](https://example.com/2).",
+            "citations",
         )
-
-        # 3. Streaming chunk boundaries across space and period
         rw = CitationRewriter([])
+        first_chunk = (
+            "This girl is **Hina Yumihara** from the 2014 mecha "
+            "anime **Buddy Complex** "
+        )
         chunks = [
-            "This girl is **Hina Yumihara** from the 2014 mecha anime **Buddy Complex** ",
+            first_chunk,
             ".\n\n*   **Studio**: Sunrise ",
             " .\n*   **Plot Summary**: High school student",
             " .",
         ]
         streamed = "".join(rw.feed(c) for c in chunks) + rw.finish()
-        self.assertNotIn(" .", streamed)
-        self.assertIn("**Buddy Complex**.", streamed)
-        self.assertIn("Sunrise.", streamed)
-        self.assertIn("High school student.", streamed)
+        _check_absent(streamed, " .", "streamed")
+        _check_contains(streamed, "**Buddy Complex**.", "complex stream")
+        _check_contains(streamed, "Sunrise.", "studio stream")
+        _check_contains(streamed, "High school student.", "student stream")
 
-    @override
-    def setUp(self) -> None:
-        self.tmpdir = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.tmpdir.name) / "test_data.sqlite"
-        self.accounts_path = Path(self.tmpdir.name) / "accounts.txt"
-        self.accounts_path.write_text('account 1\n{"userToken": "test_tok_1"}')
-
-        self.storage = Storage(self.db_path)
-        self.pool = AccountPool(self.accounts_path)
-
-        self.manager = ConversationManager(
-            self.pool, DummySolver(), storage=self.storage
-        )
-        self.fake_client = FakeDeepSeekClient("test_tok_1")
-        self.manager._clients["test_tok_1"] = self.fake_client
-
-        main_mod._storage = self.storage
-        main_mod._pool = self.pool
-        main_mod._solver = DummySolver()
-        main_mod._manager = self.manager
-        self.client = TestClient(main_mod.app)
-
-    @override
-    def tearDown(self) -> None:
-        self.tmpdir.cleanup()
-
-    def test_user_branching_and_new_chat_scenario(self):
-        # 1. Turn 1: My name is Petrig. Answer in one sentence only.
-        msgs = [
+    def test_user_branching_and_new_chat_scenario(self) -> None:
+        """Check branching and new chat isolation."""
+        msgs: list[dict[str, str]] = [
             {
                 "role": "user",
                 "content": "My name is Petrig. Answer in one sentence only.",
-            }
+            },
         ]
-        r1 = self.client.post(
-            "/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs}
+        ans1 = self._post_and_answer(msgs)
+        _check_equal(ans1, "Your name is Petrig.", "ans1")
+        self._check_parent_none()
+        msgs.extend(
+            [
+                {"role": "assistant", "content": ans1},
+                {
+                    "role": "user",
+                    "content": _NAME_AGAIN_PROMPT,
+                },
+            ],
         )
-        self.assertEqual(r1.status_code, 200)
-        ans1 = r1.json()["choices"][0]["message"]["content"]
-        self.assertEqual(ans1, "Your name is Petrig.")
-        self.assertIsNone(self.fake_client.recorded_calls[-1]["parent_message_id"])
-
-        # 2. Turn 2: what is my name again? Answer in one sentence only.
-        msgs.append({"role": "assistant", "content": ans1})
-        msgs.append(
+        ans2 = self._post_and_answer(msgs)
+        _check_equal(ans2, "Your name is Petrig.", "ans2")
+        self._check_parent(_PARENT_FIRST, "turn2")
+        branch_a = [
+            *msgs,
+            {"role": "assistant", "content": ans2},
             {
                 "role": "user",
-                "content": "what is my name again? Answer in one sentence only.",
-            }
-        )
-        r2 = self.client.post(
-            "/v1/chat/completions", json={"model": "deepseek-chat", "messages": msgs}
-        )
-        self.assertEqual(r2.status_code, 200)
-        ans2 = r2.json()["choices"][0]["message"]["content"]
-        self.assertEqual(ans2, "Your name is Petrig.")
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 101)
-
-        # 3. Branch A: remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.
-        branch_a = list(msgs)
-        branch_a.append({"role": "assistant", "content": ans2})
-        branch_a.append(
+                "content": _REMEMBER_PROMPT,
+            },
+        ]
+        ans3_a = self._post_and_answer(branch_a)
+        _check_equal(ans3_a, "understood", "branch a")
+        self._check_parent(_PARENT_SECOND, "branch a")
+        branch_b = [
+            *msgs,
+            {"role": "assistant", "content": ans2},
             {
                 "role": "user",
-                "content": 'remember the string `*h#n3XBe8Y$SjJ92y4FX`. reply with "understood" only.',
-            }
-        )
-        r3_a = self.client.post(
-            "/v1/chat/completions",
-            json={"model": "deepseek-chat", "messages": branch_a},
-        )
-        self.assertEqual(r3_a.status_code, 200)
-        ans3_a = r3_a.json()["choices"][0]["message"]["content"]
-        self.assertEqual(ans3_a, "understood")
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 102)
-
-        # 4. Branch B: replied at output "Your name is Petrig." (after Turn 2, BEFORE Turn 3)
-        branch_b = list(msgs)
-        branch_b.append({"role": "assistant", "content": ans2})
-        branch_b.append(
-            {"role": "user", "content": "what string did i ask you to remember again?"}
-        )
-        r3_b = self.client.post(
-            "/v1/chat/completions",
-            json={"model": "deepseek-chat", "messages": branch_b},
-        )
-        self.assertEqual(r3_b.status_code, 200)
-        ans3_b = r3_b.json()["choices"][0]["message"]["content"]
-        # Must branch from Turn 2 (parent_message_id == 102), NOT from Branch A (parent_message_id == 103)
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 102)
-        self.assertEqual(ans3_b, "You haven't asked me to remember any string.")
-
-        # 5. New chat 1: "what is my name again? Answer in one sentence only." on its own
-        r_new_1 = self.client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "deepseek-chat",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "what is my name again? Answer in one sentence only.",
-                    }
-                ],
+                "content": _STRING_AGAIN_PROMPT,
             },
+        ]
+        ans3_b = self._post_and_answer(branch_b)
+        self._check_parent(_PARENT_SECOND, "branch b")
+        _check_equal(
+            ans3_b,
+            "You haven't asked me to remember any string.",
+            "branch b",
         )
-        self.assertEqual(r_new_1.status_code, 200)
-        ans_new_1 = r_new_1.json()["choices"][0]["message"]["content"]
-        # Isolated new chat has no parent message id
-        self.assertIsNone(self.fake_client.recorded_calls[-1]["parent_message_id"])
-        self.assertEqual(ans_new_1, "I don't know your name.")
+        ans_new_1 = self._post_and_answer(
+            [
+                {
+                    "role": "user",
+                    "content": _NAME_AGAIN_PROMPT,
+                },
+            ],
+        )
+        self._check_parent_none()
+        _check_equal(ans_new_1, "I don't know your name.", "new1")
+        ans_new_2 = self._post_and_answer(
+            [
+                {
+                    "role": "user",
+                    "content": _STRING_AGAIN_PROMPT,
+                },
+            ],
+        )
+        self._check_parent_none()
+        _check_equal(
+            ans_new_2,
+            "You haven't asked me to remember any string.",
+            "new2",
+        )
 
-        # 6. New chat 2: "what string did i ask you to remember again?" on its own
-        r_new_2 = self.client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "deepseek-chat",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "what string did i ask you to remember again?",
-                    }
-                ],
-            },
+    def _post_and_answer(self, messages: list[dict[str, str]]) -> str:
+        """Post chat and return content.
+
+        Returns:
+            str: Assistant content.
+
+        Raises:
+            AssertionError: If status is not ok.
+            TypeError: If response shape is invalid.
+
+        """
+        resp = self.client.post(
+            _ENDPOINT,
+            json={"model": _MODEL_CHAT, "messages": messages},
         )
-        self.assertEqual(r_new_2.status_code, 200)
-        ans_new_2 = r_new_2.json()["choices"][0]["message"]["content"]
-        self.assertIsNone(self.fake_client.recorded_calls[-1]["parent_message_id"])
-        self.assertEqual(ans_new_2, "You haven't asked me to remember any string.")
+        _check_equal(resp.status_code, _HTTP_OK, "status")
+        data = resp.json()
+        choices = data["choices"]
+        if not isinstance(choices, list) or not choices:
+            msg = "missing choices"
+            raise AssertionError(msg)
+        first = choices[0]
+        if not isinstance(first, dict):
+            msg = "bad choice shape"
+            raise TypeError(msg)
+        message = first.get("message")
+        if not isinstance(message, dict):
+            msg = "bad message shape"
+            raise TypeError(msg)
+        content = message.get("content")
+        if not isinstance(content, str):
+            msg = "bad content shape"
+            raise TypeError(msg)
+        return content
+
+    def _check_parent(self, expected: int, label: str) -> None:
+        """Check last parent id matches."""
+        actual = self.fake_client.recorded_calls[-1]["parent_message_id"]
+        _check_equal(actual, expected, label)
+
+    def _check_parent_none(self) -> None:
+        """Check last parent is None."""
+        actual = self.fake_client.recorded_calls[-1]["parent_message_id"]
+        _check_is_none(actual, "parent")
 
 
 if __name__ == "__main__":

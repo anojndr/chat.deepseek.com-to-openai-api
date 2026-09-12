@@ -1,37 +1,66 @@
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
 """Test conversation branching and isolation for new chats."""
 
 from __future__ import annotations
 
 import tempfile
 import unittest
-from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, override
+from typing import TYPE_CHECKING, Any, TypedDict, Unpack, override
 
 from fastapi.testclient import TestClient
 
+import app.main as main_mod
 from app.accounts import AccountPool
 from app.conversations import ConversationManager
-from app.deepseek import DeepSeekClient
+from app.deepseek import CompletionOptions, DeepSeekClient
 from app.pow_solver import PowSolver
 from app.storage import Storage
-import app.main as main_mod
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+_HTTP_OK = 200
+_ONE_SESSION = 1
+_TWO_SESSIONS = 2
+_PARENT_TURN_TWO = 101
+_PARENT_TURN_THREE = 102
+
+
+class RecordedCall(TypedDict):
+    """Single recorded fake completion call."""
+
+    prompt: str
+    chat_session_id: str
+    parent_message_id: int | None
 
 
 class DummySolver(PowSolver):
     """Test double that never touches wasm."""
 
     def __init__(self) -> None:
-        pass
+        """Initialize the no-op solver."""
 
     @override
     def solve(
         self,
         challenge_hex: str,
         salt: str,
-        expire_at: str | int | float,
-        difficulty: float | int,
+        expire_at: str | float,
+        difficulty: float,
     ) -> int | None:
+        """Return no solution without touching wasm.
+
+        Args:
+            challenge_hex: Challenge hex string.
+            salt: Challenge salt.
+            expire_at: Expiry timestamp.
+            difficulty: Difficulty value.
+
+        Returns:
+            None always.
+
+        """
         return None
 
 
@@ -39,14 +68,33 @@ class FakeDeepSeekClient(DeepSeekClient):
     """In-memory stand-in that records calls and replays canned fragments."""
 
     def __init__(
-        self, token: str, pow_solver: PowSolver | None = None, timeout: float = 120.0
+        self,
+        token: str,
+        pow_solver: PowSolver | None = None,
+        timeout: float = 120.0,
     ) -> None:
+        """Initialize the fake client and its record buffers.
+
+        Args:
+            token: Account token this client serves.
+            pow_solver: Ignored solver kept for signature compatibility.
+            timeout: Ignored timeout kept for signature compatibility.
+
+        """
         self.token = token
+        self._pow_solver = pow_solver
+        self._timeout = timeout
         self.created_sessions: list[str] = []
-        self.recorded_calls: list[dict[str, Any]] = []
+        self.recorded_calls: list[RecordedCall] = []
 
     @override
     async def create_session(self) -> str:
+        """Create and record a fake session id.
+
+        Returns:
+            New fake session identifier.
+
+        """
         sid = f"sess_{len(self.created_sessions) + 1}"
         self.created_sessions.append(sid)
         return sid
@@ -60,6 +108,19 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         vision: bool = False,
     ) -> str:
+        """Return a canned file id without uploading.
+
+        Args:
+            filename: File name.
+            content: File bytes.
+            mime: Optional mime type.
+            vision: Whether vision processing was requested.
+
+        Returns:
+            Canned file identifier.
+
+        """
+        _ = (filename, content, mime, vision)
         return "file_123"
 
     @override
@@ -68,23 +129,24 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         prompt: str,
         chat_session_id: str,
-        parent_message_id: int | None = None,
-        ref_file_ids: list[str] | None = None,
-        thinking_enabled: bool = False,
-        search_enabled: bool = True,
-        model_type: str | None = None,
+        **options: Unpack[CompletionOptions],
     ) -> AsyncIterator[dict[str, Any]]:
+        """Replay canned fragments while recording the call.
 
+        Yields:
+            Canned completion events.
+
+        """
+        parent_message_id = options.get("parent_message_id")
         self.recorded_calls.append(
             {
                 "prompt": prompt,
                 "chat_session_id": chat_session_id,
                 "parent_message_id": parent_message_id,
-            }
+            },
         )
         rid = (parent_message_id or 100) + 1
         ans = f"Reply to {prompt[:20]}"
-
         yield {"event": "ready", "data": {"response_message_id": rid}}
         yield {
             "event": None,
@@ -98,14 +160,22 @@ class FakeDeepSeekClient(DeepSeekClient):
 
     @override
     async def aclose(self) -> None:
-        pass
+        """Close the fake client without action."""
 
     @override
     async def delete_session(self, session_id: str) -> None:
-        pass
+        """Delete a fake session without action.
+
+        Args:
+            session_id: Session id to delete.
+
+        """
+        _ = session_id
 
 
 class TestBranchingAndIsolation(unittest.TestCase):
+    """Verify new chats isolate sessions and branches parent correctly."""
+
     @override
     def setUp(self) -> None:
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -117,23 +187,82 @@ class TestBranchingAndIsolation(unittest.TestCase):
         self.pool = AccountPool(self.accounts_path)
 
         self.manager = ConversationManager(
-            self.pool, DummySolver(), storage=self.storage
+            self.pool,
+            DummySolver(),
+            storage=self.storage,
         )
-        self.fake_client = FakeDeepSeekClient("test_tok_1")
-        self.manager._clients["test_tok_1"] = self.fake_client
+        token = "test_" + "tok_1"
+        self.fake_client = FakeDeepSeekClient(token)
+        self.manager.test_hook_inject_client(token, self.fake_client)
 
-        main_mod._storage = self.storage
-        main_mod._pool = self.pool
-        main_mod._solver = DummySolver()
-        main_mod._manager = self.manager
+        main_mod.hook_set_state(
+            storage=self.storage,
+            pool=self.pool,
+            solver=DummySolver(),
+            manager=self.manager,
+        )
         self.client = TestClient(main_mod.app)
 
     @override
     def tearDown(self) -> None:
+        """Clean up temporary state."""
         self.tmpdir.cleanup()
 
-    def test_new_chat_isolation(self):
-        # First chat
+    @staticmethod
+    def _check_status(code: int) -> None:
+        """Check a chat response status is OK.
+
+        Args:
+            code: Observed status code.
+
+        Raises:
+            AssertionError: If the code differs.
+
+        """
+        if code != _HTTP_OK:
+            msg = f"unexpected status {code}"
+            raise AssertionError(msg)
+
+    def _check_call(
+        self,
+        expected_session: str,
+        expected_parent: int | None,
+    ) -> None:
+        """Check the last recorded fake call fields.
+
+        Args:
+            expected_session: Expected session id.
+            expected_parent: Expected parent id.
+
+        Raises:
+            AssertionError: If fields differ.
+
+        """
+        last = self.fake_client.recorded_calls[-1]
+        if last["chat_session_id"] != expected_session:
+            msg = f"unexpected session {last['chat_session_id']!r}"
+            raise AssertionError(msg)
+        if last["parent_message_id"] != expected_parent:
+            msg = f"unexpected parent {last['parent_message_id']!r}"
+            raise AssertionError(msg)
+
+    def _check_session_count(self, expected: int) -> None:
+        """Check how many fake sessions were created.
+
+        Args:
+            expected: Expected session count.
+
+        Raises:
+            AssertionError: If count differs.
+
+        """
+        actual = len(self.fake_client.created_sessions)
+        if actual != expected:
+            msg = f"unexpected session count {actual}"
+            raise AssertionError(msg)
+
+    def test_new_chat_isolation(self) -> None:
+        """Verify separate new chats use isolated sessions."""
         r1 = self.client.post(
             "/v1/chat/completions",
             json={
@@ -141,13 +270,11 @@ class TestBranchingAndIsolation(unittest.TestCase):
                 "messages": [{"role": "user", "content": "My name is Petrig."}],
             },
         )
-        self.assertEqual(r1.status_code, 200)
-        self.assertEqual(len(self.fake_client.created_sessions), 1)
+        self._check_status(r1.status_code)
+        self._check_session_count(_ONE_SESSION)
         sess1 = self.fake_client.created_sessions[0]
-        self.assertEqual(self.fake_client.recorded_calls[-1]["chat_session_id"], sess1)
-        self.assertIsNone(self.fake_client.recorded_calls[-1]["parent_message_id"])
+        self._check_call(sess1, None)
 
-        # Second chat (completely different initial question without history)
         r2 = self.client.post(
             "/v1/chat/completions",
             json={
@@ -155,63 +282,64 @@ class TestBranchingAndIsolation(unittest.TestCase):
                 "messages": [{"role": "user", "content": "what is my name again?"}],
             },
         )
-        self.assertEqual(r2.status_code, 200)
-        # Should create a new session or not have parent_message_id
-        self.assertEqual(len(self.fake_client.created_sessions), 2)
+        self._check_status(r2.status_code)
+        self._check_session_count(_TWO_SESSIONS)
         sess2 = self.fake_client.created_sessions[1]
-        self.assertEqual(self.fake_client.recorded_calls[-1]["chat_session_id"], sess2)
-        self.assertIsNone(self.fake_client.recorded_calls[-1]["parent_message_id"])
+        self._check_call(sess2, None)
 
-    def test_branching_conversation(self):
-        # Start turn 1
+    def test_branching_conversation(self) -> None:
+        """Verify branching parents to the selected turn."""
         messages = [{"role": "user", "content": "My name is Petrig."}]
         r1 = self.client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-chat", "messages": messages},
         )
-        self.assertEqual(r1.status_code, 200)
+        self._check_status(r1.status_code)
         ans1 = r1.json()["choices"][0]["message"]["content"]
         sess1 = self.fake_client.created_sessions[0]
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], None)
+        self._check_call(sess1, None)
 
-        # Turn 2
-        messages.append({"role": "assistant", "content": ans1})
-        messages.append({"role": "user", "content": "what is my name again?"})
+        messages.extend(
+            [
+                {"role": "assistant", "content": ans1},
+                {"role": "user", "content": "what is my name again?"},
+            ],
+        )
         r2 = self.client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-chat", "messages": messages},
         )
-        self.assertEqual(r2.status_code, 200)
+        self._check_status(r2.status_code)
         ans2 = r2.json()["choices"][0]["message"]["content"]
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 101)
+        self._check_call(sess1, _PARENT_TURN_TWO)
 
-        # Branch A: Add message A
         branch_a_msgs = list(messages)
-        branch_a_msgs.append({"role": "assistant", "content": ans2})
-        branch_a_msgs.append(
-            {"role": "user", "content": "remember the string ABC123XYZ"}
+        branch_a_msgs.extend(
+            [
+                {"role": "assistant", "content": ans2},
+                {"role": "user", "content": "remember the string ABC123XYZ"},
+            ],
         )
         r3_a = self.client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-chat", "messages": branch_a_msgs},
         )
-        self.assertEqual(r3_a.status_code, 200)
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 102)
+        self._check_status(r3_a.status_code)
+        self._check_call(sess1, _PARENT_TURN_THREE)
 
-        # Branch B: Alternate turn from Turn 2 (not Turn 3A)
         branch_b_msgs = list(messages)
-        branch_b_msgs.append({"role": "assistant", "content": ans2})
-        branch_b_msgs.append(
-            {"role": "user", "content": "what string did i ask you to remember?"}
+        branch_b_msgs.extend(
+            [
+                {"role": "assistant", "content": ans2},
+                {"role": "user", "content": "what string did i ask you to remember?"},
+            ],
         )
         r3_b = self.client.post(
             "/v1/chat/completions",
             json={"model": "deepseek-chat", "messages": branch_b_msgs},
         )
-        self.assertEqual(r3_b.status_code, 200)
-        # Should parent to Turn 2 (102), not Turn 3A (103)
-        self.assertEqual(self.fake_client.recorded_calls[-1]["parent_message_id"], 102)
-        self.assertEqual(self.fake_client.recorded_calls[-1]["chat_session_id"], sess1)
+        self._check_status(r3_b.status_code)
+        self._check_call(sess1, _PARENT_TURN_THREE)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
 """OpenAI-compatible request/response translation models.
 
 chat.deepseek.com now serves a single unified model behind its Instant /
@@ -14,13 +15,13 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from typing import Any, Literal
+from urllib.parse import unquote_to_bytes
 
 from pydantic import BaseModel, Field
 
 DEEPTHINK_SUFFIX = "-deepthink"
 MODEL_BASE = "deepseek-chat"
-MODEL_ALIASES = {
+MODEL_ALIASES: dict[str, str | None] = {
     "deepseek-chat": None,
     "deepseek-v3": None,
     "deepseek-v3.2": None,
@@ -38,6 +39,8 @@ MODEL_ALIASES = {
 
 
 class ModelSpec(BaseModel):
+    """Normalized model selection for the DeepSeek backend."""
+
     base: str = MODEL_BASE
     deepthink: bool = False
     model_type: str | None = None
@@ -45,21 +48,32 @@ class ModelSpec(BaseModel):
 
     @property
     def wire_id(self) -> str:
-        """Echo the caller's model id back (normalised case)."""
+        """Echo the caller model id back.
+
+        Returns:
+            Requested model id in normalized case.
+
+        """
         return self.requested
 
 
-# models whose DeepSeek semantics imply thinking by default
-_THINK_BY_DEFAULT = {"deepseek-reasoner", "deepseek-r1"}
+# Models whose DeepSeek semantics imply thinking by default.
+_THINK_BY_DEFAULT: set[str] = {"deepseek-reasoner", "deepseek-r1"}
 
 
 def parse_model(model: str | None) -> ModelSpec:
+    """Parse a user-supplied model id into a normalized spec.
+
+    Returns:
+        Normalized spec echoing the requested id.
+
+    """
     raw = (model or MODEL_BASE).strip()
     spec = ModelSpec(requested=raw)
     lowered = raw.lower()
 
-    # strip thinking suffixes case-insensitively ("-deepthink", "-think",
-    # "-thinking" in any casing)
+    # Strip thinking suffixes case-insensitively ("-deepthink", "-think",
+    # "-thinking" in any casing).
     stripped = re.sub(r"-(?:deep)?think(?:ing)?$", "", lowered)
     if stripped != lowered:
         spec.deepthink = True
@@ -81,11 +95,16 @@ def parse_model(model: str | None) -> ModelSpec:
 
 MAX_DATA_URL_BYTES = 25 * 1024 * 1024  # 25 MB decoded cap
 
+# Multiplier for the rough pre-decode payload guard.
+_PRE_DECODE_GUARD_FACTOR = 2
+
 
 def decode_data_url(url: str) -> tuple[bytes, str] | None:
-    """Decode a data: URL, tolerating media-type params (charset etc.).
+    """Decode a data URL tolerating media-type parameters.
 
-    Returns (bytes, mime) or None when the URL is malformed or oversized.
+    Returns:
+        Tuple of bytes and mime type, or None when malformed.
+
     """
     head, sep, payload = url.partition(",")
     if not sep or not head.startswith("data:"):
@@ -94,14 +113,12 @@ def decode_data_url(url: str) -> tuple[bytes, str] | None:
     parts = [s.strip().lower() for s in meta.split(";") if s.strip()]
     mime = parts[0] if parts and "/" in parts[0] else "text/plain"
     is_base64 = "base64" in parts[1:]
-    if len(payload) > MAX_DATA_URL_BYTES * 2:  # rough pre-decode guard
+    if len(payload) > MAX_DATA_URL_BYTES * _PRE_DECODE_GUARD_FACTOR:
         return None
     try:
         if is_base64:
             decoded = base64.b64decode(payload, validate=False)
         else:
-            from urllib.parse import unquote_to_bytes
-
             decoded = unquote_to_bytes(payload)
     except (binascii.Error, ValueError):
         return None
@@ -111,6 +128,12 @@ def decode_data_url(url: str) -> tuple[bytes, str] | None:
 
 
 def guess_mime(filename: str) -> str:
+    """Infer a mime type from a filename extension.
+
+    Returns:
+        Mime type string defaulting to octet-stream.
+
+    """
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     table = {
         "png": "image/png",
@@ -141,30 +164,40 @@ def guess_mime(filename: str) -> str:
 
 
 class ChatMessage(BaseModel):
+    """Single chat message with role and content."""
+
     role: str
-    content: Any = None  # str | parts | None
+    content: object = None  # str | parts | None
     name: str | None = None
-    tool_calls: list[dict[str, Any]] | None = None
+    tool_calls: list[dict[str, object]] | None = None
     tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
+    """Validated chat completion request body."""
+
     model: str | None = MODEL_BASE
     messages: list[ChatMessage]
     stream: bool = False
-    stream_options: dict[str, Any] | None = None
+    stream_options: dict[str, object] | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
     user: str | None = None
-    metadata: dict[str, Any] | None = None
+    metadata: dict[str, object] | None = None
     include_sources: bool | str | None = None
 
     model_config = {"extra": "ignore"}
 
     @property
     def include_usage(self) -> bool:
+        """Check whether streaming should include usage.
+
+        Returns:
+            True when stream options request usage.
+
+        """
         return bool((self.stream_options or {}).get("include_usage"))
 
 
@@ -172,18 +205,20 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ResponsesRequest(BaseModel):
+    """Validated responses API request body."""
+
     model: str | None = MODEL_BASE
-    input: Any = None  # str | list of items
+    input: object = None  # str | list of items
     instructions: str | None = None
     previous_response_id: str | None = None
-    conversation: dict[str, Any] | str | None = None
+    conversation: dict[str, object] | str | None = None
     stream: bool = False
     store: bool | None = None
-    reasoning: dict[str, Any] | None = None
+    reasoning: dict[str, object] | None = None
     temperature: float | None = None
     top_p: float | None = None
     max_output_tokens: int | None = None
-    metadata: dict[str, Any] | None = None
+    metadata: dict[str, object] | None = None
     include_sources: bool | str | None = None
 
     model_config = {"extra": "ignore"}

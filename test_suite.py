@@ -1,60 +1,100 @@
-"""Unittest test runner for all tests."""
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
+"""Run persistence regression tests."""
 
-import unittest
+from __future__ import annotations
+
 import asyncio
-from test_storage import test_storage_basic, test_conversation_manager_persistence
+import unittest
+
+from test_branching_and_isolation import TestBranchingAndIsolation
+from test_include_sources import (
+    ChatCompletionsAppendixEndpointTest,
+    IncludeSourcesFlagTest,
+    ResponsesApiAppendixEndpointTest,
+    SourceAppendixFormattingTest,
+    StreamEventsSourceEmissionTest,
+)
 from test_integration import test_app_sqlite_integration
+from test_storage import test_conversation_manager_persistence, test_storage_basic
+from test_stream_stall import TestStreamStall
 from test_turn_recovery import (
-    test_midstream_failure_recovers_with_full_replay,
     test_cancelled_stream_drops_session,
+    test_failed_empty_conversation_leaves_no_row,
+    test_failure_invalidates_stale_prefix_refs,
+    test_midstream_failure_recovers_with_full_replay,
     test_ready_persisted_before_stream_finishes,
     test_single_account_retries_empty_then_replays,
     test_stream_single_account_retries_empty,
-    test_failed_empty_conversation_leaves_no_row,
-    test_failure_invalidates_stale_prefix_refs,
 )
+from test_unified_model import TestUnifiedFileTurns, TestUnifiedModel
 from test_user_scenario import TestUserScenario
-from test_branching_and_isolation import TestBranchingAndIsolation
-from test_include_sources import (
-    SourceAppendixFormattingTest,
-    IncludeSourcesFlagTest,
-    ChatCompletionsAppendixEndpointTest,
-    ResponsesApiAppendixEndpointTest,
-    StreamEventsSourceEmissionTest,
-)
-from test_unified_model import TestUnifiedModel, TestUnifiedFileTurns
-from test_stream_stall import TestStreamStall
+
+__all__ = [
+    "ChatCompletionsAppendixEndpointTest",
+    "IncludeSourcesFlagTest",
+    "ResponsesApiAppendixEndpointTest",
+    "SourceAppendixFormattingTest",
+    "StreamEventsSourceEmissionTest",
+    "TestBranchingAndIsolation",
+    "TestSQLitePersistence",
+    "TestStreamStall",
+    "TestUnifiedFileTurns",
+    "TestUnifiedModel",
+    "TestUserScenario",
+]
 
 
 class TestSQLitePersistence(unittest.TestCase):
-    def test_basic_storage(self):
+    """Exercise SQLite persistence paths."""
+
+    @staticmethod
+    def test_basic_storage() -> None:
+        """Check basic storage round trip."""
         test_storage_basic()
 
-    def test_manager_persistence(self):
+    @staticmethod
+    def test_manager_persistence() -> None:
+        """Check manager persistence round trip."""
         asyncio.run(test_conversation_manager_persistence())
 
-    def test_integration(self):
+    @staticmethod
+    def test_integration() -> None:
+        """Check app SQLite integration."""
         test_app_sqlite_integration()
 
-    def test_midstream_failure_recovery(self):
+    @staticmethod
+    def test_midstream_failure_recovery() -> None:
+        """Check midstream failure recovery."""
         asyncio.run(test_midstream_failure_recovers_with_full_replay())
 
-    def test_cancelled_stream_recovery(self):
+    @staticmethod
+    def test_cancelled_stream_recovery() -> None:
+        """Check cancelled stream recovery."""
         asyncio.run(test_cancelled_stream_drops_session())
 
-    def test_ready_persisted_early(self):
+    @staticmethod
+    def test_ready_persisted_early() -> None:
+        """Check ready marker persists early."""
         asyncio.run(test_ready_persisted_before_stream_finishes())
 
-    def test_single_account_empty_retry(self):
+    @staticmethod
+    def test_single_account_empty_retry() -> None:
+        """Check single account empty retry."""
         asyncio.run(test_single_account_retries_empty_then_replays())
 
-    def test_stream_single_account_empty_retry(self):
+    @staticmethod
+    def test_stream_single_account_empty_retry() -> None:
+        """Check streaming empty retry."""
         asyncio.run(test_stream_single_account_retries_empty())
 
-    def test_empty_failure_leaves_no_row(self):
+    @staticmethod
+    def test_empty_failure_leaves_no_row() -> None:
+        """Check empty failure leaves no row."""
         asyncio.run(test_failed_empty_conversation_leaves_no_row())
 
-    def test_stale_prefix_invalidated(self):
+    @staticmethod
+    def test_stale_prefix_invalidated() -> None:
+        """Check stale prefix invalidation."""
         asyncio.run(test_failure_invalidates_stale_prefix_refs())
 
 

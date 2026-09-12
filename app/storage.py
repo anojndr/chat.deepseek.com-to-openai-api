@@ -1,4 +1,9 @@
-"""SQLite storage for conversations and response links to persist state across restarts."""
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
+"""Persist conversations and response links across restarts.
+
+Thread-safe SQLite storage for conversation state, multi-turn prefix hashes,
+and response links so follow-ups survive process restarts.
+"""
 
 from __future__ import annotations
 
@@ -6,13 +11,20 @@ import json
 import sqlite3
 import threading
 import time
-from pathlib import Path
-from typing import Any
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TypedDict, Unpack
+
+# Prune the prefixes table once it grows past this many rows.
+_MAX_PREFIX_ROWS = 20_000
+# 24 hour TTL applied to stale prefix rows during pruning.
+_PREFIX_TTL_SECONDS = 24 * 3600.0
 
 
 @dataclass
 class ConvRef:
+    """Reference to a stored conversation prefix."""
+
     conversation_key: str
     account_index: int | None
     account_token: str
@@ -22,10 +34,36 @@ class ConvRef:
     updated_at: float
 
 
+class ConversationRow(TypedDict):
+    """Conversation record read back from SQLite."""
+
+    id: str
+    account_index: int | None
+    account_token: str | None
+    deepseek_session_id: str | None
+    parent_message_id: int | None
+    history: list[dict[str, str]]
+    created_at: float
+    last_used_at: float
+
+
+class ConversationSnapshot(TypedDict):
+    """Fields persisted for one conversation turn."""
+
+    account_index: int | None
+    account_token: str | None
+    deepseek_session_id: str | None
+    parent_message_id: int | None
+    history: list[dict[str, str]]
+    created_at: float
+    last_used_at: float
+
+
 class Storage:
     """Thread-safe SQLite storage for conversations and response links."""
 
     def __init__(self, db_path: Path | str) -> None:
+        """Open the database and create tables."""
         self.db_path = Path(db_path)
         self._local = threading.local()
         self._init_db()
@@ -62,7 +100,7 @@ class Storage:
                     created_at REAL NOT NULL,
                     last_used_at REAL NOT NULL
                 )
-                """
+                """,
             )
             conn.execute(
                 """
@@ -72,13 +110,13 @@ class Storage:
                     model TEXT NOT NULL,
                     created_at REAL NOT NULL
                 )
-                """
+                """,
             )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_response_links_created
                 ON response_links(created_at)
-                """
+                """,
             )
             conn.execute(
                 """
@@ -92,19 +130,19 @@ class Storage:
                     turns INTEGER NOT NULL,
                     updated_at REAL NOT NULL
                 )
-                """
+                """,
             )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_prefixes_updated
                 ON prefixes(updated_at)
-                """
+                """,
             )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_prefixes_session
                 ON prefixes(deepseek_session_id)
-                """
+                """,
             )
             conn.execute(
                 """
@@ -118,20 +156,26 @@ class Storage:
                     created REAL NOT NULL,
                     snapshot_json TEXT NOT NULL
                 )
-                """
+                """,
             )
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_response_snapshots_created
                 ON response_snapshots(created)
-                """
+                """,
             )
 
     # -----------------------------------------------------------------------
     # Conversations
     # -----------------------------------------------------------------------
 
-    def get_conversation(self, key: str) -> dict[str, Any] | None:
+    def get_conversation(self, key: str) -> ConversationRow | None:
+        """Fetch one stored conversation by key.
+
+        Returns:
+            ConversationRow | None: Conversation record, or None when missing.
+
+        """
         conn = self._get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -146,18 +190,24 @@ class Storage:
         row = cur.fetchone()
         if row is None:
             return None
-        return {
-            "id": row["key"],
-            "account_index": row["account_index"],
-            "account_token": row["account_token"],
-            "deepseek_session_id": row["deepseek_session_id"],
-            "parent_message_id": row["parent_message_id"],
-            "history": json.loads(row["history"]),
-            "created_at": row["created_at"],
-            "last_used_at": row["last_used_at"],
-        }
+        return ConversationRow(
+            id=row["key"],
+            account_index=row["account_index"],
+            account_token=row["account_token"],
+            deepseek_session_id=row["deepseek_session_id"],
+            parent_message_id=row["parent_message_id"],
+            history=json.loads(row["history"]),
+            created_at=row["created_at"],
+            last_used_at=row["last_used_at"],
+        )
 
-    def get_all_conversations(self) -> dict[str, dict[str, Any]]:
+    def get_all_conversations(self) -> dict[str, ConversationRow]:
+        """Fetch every stored conversation keyed by id.
+
+        Returns:
+            dict[str, ConversationRow]: Stored conversations by key.
+
+        """
         conn = self._get_conn()
         cur = conn.cursor()
         cur.execute(
@@ -165,34 +215,28 @@ class Storage:
             SELECT key, account_index, account_token, deepseek_session_id,
                    parent_message_id, history, created_at, last_used_at
             FROM conversations
-            """
+            """,
         )
-        results = {}
+        results: dict[str, ConversationRow] = {}
         for row in cur.fetchall():
-            results[row["key"]] = {
-                "id": row["key"],
-                "account_index": row["account_index"],
-                "account_token": row["account_token"],
-                "deepseek_session_id": row["deepseek_session_id"],
-                "parent_message_id": row["parent_message_id"],
-                "history": json.loads(row["history"]),
-                "created_at": row["created_at"],
-                "last_used_at": row["last_used_at"],
-            }
+            results[row["key"]] = ConversationRow(
+                id=row["key"],
+                account_index=row["account_index"],
+                account_token=row["account_token"],
+                deepseek_session_id=row["deepseek_session_id"],
+                parent_message_id=row["parent_message_id"],
+                history=json.loads(row["history"]),
+                created_at=row["created_at"],
+                last_used_at=row["last_used_at"],
+            )
         return results
 
     def save_conversation(
         self,
         key: str,
-        *,
-        account_index: int | None,
-        account_token: str | None,
-        deepseek_session_id: str | None,
-        parent_message_id: int | None,
-        history: list[dict[str, str]],
-        created_at: float,
-        last_used_at: float,
+        **fields: Unpack[ConversationSnapshot],
     ) -> None:
+        """Persist one conversation snapshot."""
         conn = self._get_conn()
         conn.execute(
             """
@@ -210,17 +254,23 @@ class Storage:
             """,
             (
                 key,
-                account_index,
-                account_token,
-                deepseek_session_id,
-                parent_message_id,
-                json.dumps(history, ensure_ascii=False),
-                created_at,
-                last_used_at,
+                fields["account_index"],
+                fields["account_token"],
+                fields["deepseek_session_id"],
+                fields["parent_message_id"],
+                json.dumps(fields["history"], ensure_ascii=False),
+                fields["created_at"],
+                fields["last_used_at"],
             ),
         )
 
     def delete_conversation(self, key: str) -> bool:
+        """Delete one stored conversation.
+
+        Returns:
+            bool: True when a row was removed.
+
+        """
         conn = self._get_conn()
         cur = conn.cursor()
         cur.execute("DELETE FROM conversations WHERE key = ?", (key,))
@@ -231,7 +281,12 @@ class Storage:
     # -----------------------------------------------------------------------
 
     def find_prefix(self, hashes: list[str]) -> tuple[int, ConvRef] | None:
-        """Longest prefix match. Returns (matched_len, ref)."""
+        """Find the longest matching hash prefix.
+
+        Returns:
+            tuple[int, ConvRef] | None: Matched length and ref, else None.
+
+        """
         if not hashes:
             return None
         conn = self._get_conn()
@@ -297,8 +352,8 @@ class Storage:
         # Prune old prefixes if table is large (> 20,000)
         cur = conn.execute("SELECT COUNT(*) FROM prefixes")
         count = cur.fetchone()[0]
-        if count > 20000:
-            cutoff = now - 24 * 3600.0  # 24 hour TTL
+        if count > _MAX_PREFIX_ROWS:
+            cutoff = now - _PREFIX_TTL_SECONDS
             conn.execute("DELETE FROM prefixes WHERE updated_at < ?", (cutoff,))
 
     def delete_session_refs(self, session_id: str | None) -> int:
@@ -309,6 +364,10 @@ class Storage:
         longest-prefix match (which would fail deterministically). Parent
         chains that shared the session fall back to a fresh session with
         full-history replay instead.
+
+        Returns:
+            int: Number of prefix rows removed.
+
         """
         if not session_id:
             return 0
@@ -320,8 +379,15 @@ class Storage:
         return cur.rowcount
 
     def delete_stale_conversations(
-        self, max_idle_seconds: float
-    ) -> list[dict[str, Any]]:
+        self,
+        max_idle_seconds: float,
+    ) -> list[dict[str, object]]:
+        """Delete conversations idle past the TTL.
+
+        Returns:
+            list[dict[str, object]]: Removed conversation stubs.
+
+        """
         threshold = time.time() - max_idle_seconds
         conn = self._get_conn()
         cur = conn.cursor()
@@ -333,10 +399,18 @@ class Storage:
             """,
             (threshold,),
         )
-        stale = [dict(row) for row in cur.fetchall()]
+        stale: list[dict[str, object]] = [
+            {
+                "key": row["key"],
+                "account_token": row["account_token"],
+                "deepseek_session_id": row["deepseek_session_id"],
+            }
+            for row in cur.fetchall()
+        ]
         if stale:
             cur.execute(
-                "DELETE FROM conversations WHERE last_used_at < ?", (threshold,)
+                "DELETE FROM conversations WHERE last_used_at < ?",
+                (threshold,),
             )
         return stale
 
@@ -345,13 +419,19 @@ class Storage:
     # -----------------------------------------------------------------------
 
     def store_response_link(
-        self, response_id: str, conversation_key: str, model: str, limit: int = 10_000
+        self,
+        response_id: str,
+        conversation_key: str,
+        model: str,
+        limit: int = 10_000,
     ) -> None:
+        """Store a response link, pruning past the LRU limit."""
         conn = self._get_conn()
         now = time.time()
         conn.execute(
             """
-            INSERT OR REPLACE INTO response_links (response_id, conversation_key, model, created_at)
+            INSERT OR REPLACE INTO response_links
+                (response_id, conversation_key, model, created_at)
             VALUES (?, ?, ?, ?)
             """,
             (response_id, conversation_key, model, now),
@@ -370,6 +450,12 @@ class Storage:
         )
 
     def get_response_link(self, response_id: str) -> dict[str, str] | None:
+        """Fetch a stored response link.
+
+        Returns:
+            dict[str, str] | None: Conversation and model, or None if missing.
+
+        """
         conn = self._get_conn()
         cur = conn.cursor()
         cur.execute(

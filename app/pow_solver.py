@@ -1,3 +1,4 @@
+# Copyright (c) 2026 chat.deepseek.com-to-openai-api contributors.
 """DeepSeekHashV1 proof-of-work solver.
 
 Runs the official sha3_wasm_bg.wasm module (same bytes the web client loads)
@@ -8,6 +9,8 @@ then read i32 status at retptr+0 and f64 answer at retptr+8. Status 0 means no
 solution; any other value means `answer` holds the solution.
 """
 
+from __future__ import annotations
+
 import struct
 import threading
 from pathlib import Path
@@ -15,9 +18,42 @@ from pathlib import Path
 import wasmtime
 
 _WASM_PATH = Path(__file__).resolve().parent / "vendor" / "sha3_wasm_bg.wasm"
+_MEMORY_EXPORT = "memory"
+_MEMORY_KIND = "Memory"
+_SOLVE_EXPORT = "wasm_solve"
+_STACK_EXPORT = "__wbindgen_add_to_stack_pointer"
+_ALLOC_EXPORT = "__wbindgen_export_0"
+_FUNC_KIND = "Func"
+_STACK_WHAT = "stack pointer"
+_ALLOC_WHAT = "allocator"
+
+
+class WasmExportError(TypeError):
+    """Raised when the PoW wasm module exports an unexpected value."""
+
+    def __init__(self, name: str, actual: str, expected: str) -> None:
+        """Store the export details."""
+        message = f"wasm export {name!r} is {actual}, expected {expected}"
+        super().__init__(message)
+        self.name = name
+        self.actual = actual
+        self.expected = expected
+
+
+class WasmAbiError(TypeError):
+    """Raised when the PoW wasm ABI returns an unexpected value."""
+
+    def __init__(self, what: str, actual: str) -> None:
+        """Store the ABI details."""
+        message = f"wasm {what} returned {actual}, expected int"
+        super().__init__(message)
+        self.what = what
+        self.actual = actual
 
 
 class PowSolver:
+    """Solve DeepSeekHashV1 proof-of-work challenges with wasmtime."""
+
     _store: wasmtime.Store
     _memory: wasmtime.Memory
     _solve: wasmtime.Func
@@ -26,33 +62,37 @@ class PowSolver:
     _lock: threading.Lock
 
     def __init__(self) -> None:
+        """Load the wasm module and bind its exports.
+
+        Raises:
+            WasmExportError: If a wasm export has an unexpected type.
+
+        """
         store = wasmtime.Store()
         with _WASM_PATH.open("rb") as fh:
             wasm_bytes = fh.read()
         instance = wasmtime.Instance(
-            store, wasmtime.Module(store.engine, wasm_bytes), []
+            store,
+            wasmtime.Module(store.engine, wasm_bytes),
+            [],
         )
         exports = instance.exports(store)
-        memory = exports["memory"]
+        memory = exports[_MEMORY_EXPORT]
         if not isinstance(memory, wasmtime.Memory):
-            raise TypeError(
-                f"wasm export 'memory' is {type(memory).__name__}, expected Memory"
+            raise WasmExportError(
+                _MEMORY_EXPORT,
+                type(memory).__name__,
+                _MEMORY_KIND,
             )
-        solve = exports["wasm_solve"]
+        solve = exports[_SOLVE_EXPORT]
         if not isinstance(solve, wasmtime.Func):
-            raise TypeError(
-                f"wasm export 'wasm_solve' is {type(solve).__name__}, expected Func"
-            )
-        stack = exports["__wbindgen_add_to_stack_pointer"]
+            raise WasmExportError(_SOLVE_EXPORT, type(solve).__name__, _FUNC_KIND)
+        stack = exports[_STACK_EXPORT]
         if not isinstance(stack, wasmtime.Func):
-            raise TypeError(
-                f"wasm export '__wbindgen_add_to_stack_pointer' is {type(stack).__name__}, expected Func"
-            )
-        alloc = exports["__wbindgen_export_0"]
+            raise WasmExportError(_STACK_EXPORT, type(stack).__name__, _FUNC_KIND)
+        alloc = exports[_ALLOC_EXPORT]
         if not isinstance(alloc, wasmtime.Func):
-            raise TypeError(
-                f"wasm export '__wbindgen_export_0' is {type(alloc).__name__}, expected Func"
-            )
+            raise WasmExportError(_ALLOC_EXPORT, type(alloc).__name__, _FUNC_KIND)
         self._store = store
         self._memory = memory
         self._solve = solve
@@ -66,10 +106,18 @@ class PowSolver:
         self,
         challenge_hex: str,
         salt: str,
-        expire_at: str | int | float,
-        difficulty: float | int,
+        expire_at: str | float,
+        difficulty: float,
     ) -> int | None:
-        """Return the integer answer for a DeepSeekHashV1 challenge, or None."""
+        """Return the integer answer for a DeepSeekHashV1 challenge.
+
+        Returns:
+            int | None: Solution integer, or None when wasm reports no answer.
+
+        Raises:
+            WasmAbiError: If the wasm stack pointer or allocator misbehaves.
+
+        """
         challenge_bytes = challenge_hex.encode()
         prefix_bytes = f"{salt}_{expire_at}_".encode()
 
@@ -79,23 +127,17 @@ class PowSolver:
             store = self._store
             ret_ptr_raw = self._stack(store, -16)
             if not isinstance(ret_ptr_raw, int):
-                raise TypeError(
-                    f"wasm stack pointer returned {type(ret_ptr_raw).__name__}, expected int"
-                )
+                raise WasmAbiError(_STACK_WHAT, type(ret_ptr_raw).__name__)
             ret_ptr = ret_ptr_raw
             try:
                 c_ptr_raw = self._alloc(store, len(challenge_bytes), 1)
                 if not isinstance(c_ptr_raw, int):
-                    raise TypeError(
-                        f"wasm allocator returned {type(c_ptr_raw).__name__}, expected int"
-                    )
+                    raise WasmAbiError(_ALLOC_WHAT, type(c_ptr_raw).__name__)
                 c_ptr = c_ptr_raw
                 self._memory.write(store, challenge_bytes, c_ptr)
                 p_ptr_raw = self._alloc(store, len(prefix_bytes), 1)
                 if not isinstance(p_ptr_raw, int):
-                    raise TypeError(
-                        f"wasm allocator returned {type(p_ptr_raw).__name__}, expected int"
-                    )
+                    raise WasmAbiError(_ALLOC_WHAT, type(p_ptr_raw).__name__)
                 p_ptr = p_ptr_raw
                 self._memory.write(store, prefix_bytes, p_ptr)
                 self._solve(
