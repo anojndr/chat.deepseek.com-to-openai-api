@@ -102,6 +102,12 @@ class Storage:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_prefixes_session
+                ON prefixes(deepseek_session_id)
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS response_snapshots (
                     response_id TEXT PRIMARY KEY,
                     account_index INTEGER,
@@ -294,6 +300,24 @@ class Storage:
         if count > 20000:
             cutoff = now - 24 * 3600.0  # 24 hour TTL
             conn.execute("DELETE FROM prefixes WHERE updated_at < ?", (cutoff,))
+
+    def delete_session_refs(self, session_id: str | None) -> int:
+        """Drop prefix rows pointing at a dead DeepSeek session.
+
+        Called when a turn clears its pinned session after failure so the
+        next follow-up cannot re-inherit the same dead session id via
+        longest-prefix match (which would fail deterministically). Parent
+        chains that shared the session fall back to a fresh session with
+        full-history replay instead.
+        """
+        if not session_id:
+            return 0
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM prefixes WHERE deepseek_session_id = ?",
+            (session_id,),
+        )
+        return cur.rowcount
 
     def delete_stale_conversations(
         self, max_idle_seconds: float

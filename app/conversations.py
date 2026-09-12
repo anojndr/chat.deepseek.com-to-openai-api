@@ -10,6 +10,7 @@ the accumulated transcript into a fresh session on another account.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -56,6 +57,8 @@ class StreamEvent:
 MAX_HISTORY_CHARS = 400_000
 SESSION_TTL = 6 * 3600.0
 SWEEP_INTERVAL = 900.0
+logger = logging.getLogger(__name__)
+_MIN_ATTEMPTS = 2
 
 
 class EmptyCompletion(Exception):
@@ -126,6 +129,42 @@ class ConversationManager:
                 created_at=conv.created_at,
                 last_used_at=conv.last_used_at,
             )
+
+    def _clear_session(self, conv: Conversation, *, reason: str) -> None:
+        """Drop the pinned session and invalidate prefix refs to it.
+
+        Follow-ups inherit sessions via longest-prefix match, so a dead id
+        left in `prefixes` would be re-inherited and fail deterministically.
+        """
+        dead = conv.deepseek_session_id
+        conv.deepseek_session_id = None
+        conv.parent_message_id = None
+        try:
+            self._persist_conversation(conv)
+        except Exception:
+            logger.exception("failed to persist cleared session for %s", conv.id)
+        if dead and self._storage is not None:
+            try:
+                self._storage.delete_session_refs(dead)
+            except Exception:
+                logger.exception("failed to invalidate prefix refs for dead session")
+        logger.debug("cleared session for %s: %s", conv.id, reason)
+
+    async def _drop_if_empty(self, conv: Conversation) -> None:
+        """Remove junk rows for keys that never recorded a turn.
+
+        `get_or_create` persists `[]` upfront; a turn that fails before the
+        first `_record_history` must not leave an empty row behind.
+        """
+        if conv.history:
+            return
+        async with self._lock:
+            self._conversations.pop(conv.id, None)
+        if self._storage is not None:
+            try:
+                self._storage.delete_conversation(conv.id)
+            except Exception:
+                logger.exception("failed to delete empty conversation %s", conv.id)
 
     def client_for(self, token: str) -> DeepSeekClient:
         client = self._clients.get(token)
@@ -257,7 +296,7 @@ class ConversationManager:
         hashes: list[str] | None = None,
     ) -> TurnResult:
         conv = await self.get_or_create(key)
-        attempts = max_retries or self._pool.size or 1
+        attempts = max(max_retries or 0, self._pool.size, _MIN_ATTEMPTS)
         last_error: Exception | None = None
         last_ds_error: DeepSeekError | None = None
 
@@ -311,15 +350,17 @@ class ConversationManager:
                 self._pool.mark_success(account.token)
                 return result
             except asyncio.CancelledError:
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason="cancelled")
                 raise
             except EmptyCompletion as exc:
                 last_error = exc
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason=f"empty completion: {exc}")
+                logger.warning(
+                    "run_turn empty completion key=%s attempt=%d/%d",
+                    key,
+                    attempt + 1,
+                    max(attempts, 1),
+                )
                 continue
             except Exception as exc:
                 last_error = exc
@@ -327,13 +368,20 @@ class ConversationManager:
                     last_ds_error = exc
                 if account_token:
                     self._pool.mark_failure(account_token)
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason=str(exc))
+                logger.warning(
+                    "run_turn failed key=%s attempt=%d/%d err=%s",
+                    key,
+                    attempt + 1,
+                    max(attempts, 1),
+                    exc,
+                )
                 continue
+        await self._drop_if_empty(conv)
         final = last_ds_error or DeepSeekError(
             f"all accounts failed for this turn: {last_error}"
         )
+        logger.error("run_turn exhausted key=%s err=%s", key, final)
         raise final
 
     async def stream_turn(
@@ -368,11 +416,11 @@ class ConversationManager:
         model_type: str | None,
         hashes: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        attempts = max(self._pool.size, 1)
+        attempts = max(self._pool.size, _MIN_ATTEMPTS)
         last_error: Exception | None = None
         last_ds_error: DeepSeekError | None = None
 
-        for attempt in range(attempts):
+        for attempt in range(max(attempts, 1)):
             prev_session = conv.deepseek_session_id
             account_token: str | None = None
             try:
@@ -388,9 +436,7 @@ class ConversationManager:
                 # Cancel during session create / file upload: a freshly created
                 # but message-less session must not stay pinned, or the next
                 # turn skips replay and sends a bare prompt with zero context.
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason="cancelled during setup")
                 raise
             except Exception as exc:  # muted/rate-limited/network -> rotate
                 last_error = exc
@@ -398,9 +444,14 @@ class ConversationManager:
                     last_ds_error = exc
                 if account_token:
                     self._pool.mark_failure(account_token)
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason=str(exc))
+                logger.warning(
+                    "stream_turn setup failed key=%s attempt=%d/%d err=%s",
+                    key,
+                    attempt + 1,
+                    max(attempts, 1),
+                    exc,
+                )
                 continue
 
             buffer_content: list[str] = []
@@ -481,15 +532,17 @@ class ConversationManager:
                 # half-recorded turn. Drop the pinned session so the next turn
                 # replays full history into a fresh one instead of appending at
                 # a stale parent.
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason="cancelled mid-stream")
                 raise
             except EmptyCompletion as exc:
                 last_error = exc
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason=f"empty completion: {exc}")
+                logger.warning(
+                    "stream_turn empty completion key=%s attempt=%d/%d",
+                    key,
+                    attempt + 1,
+                    max(attempts, 1),
+                )
                 continue
             except Exception as exc:
                 last_error = exc
@@ -497,9 +550,7 @@ class ConversationManager:
                     last_ds_error = exc
                 if account_token:
                     self._pool.mark_failure(account_token)
-                conv.deepseek_session_id = None
-                conv.parent_message_id = None
-                self._persist_conversation(conv)
+                self._clear_session(conv, reason=str(exc))
                 if emitted:
                     # mid-stream failure after content was streamed: surface
                     raise DeepSeekError(
@@ -507,10 +558,19 @@ class ConversationManager:
                         status=getattr(exc, "status", None),
                         biz_code=getattr(exc, "biz_code", None),
                     ) from exc
+                logger.warning(
+                    "stream_turn failed key=%s attempt=%d/%d err=%s",
+                    key,
+                    attempt + 1,
+                    max(attempts, 1),
+                    exc,
+                )
                 continue
+        await self._drop_if_empty(conv)
         final = last_ds_error or DeepSeekError(
             f"all accounts failed for this turn: {last_error}"
         )
+        logger.error("stream_turn exhausted key=%s err=%s", key, final)
         raise final
 
     # -- internals -----------------------------------------------------------

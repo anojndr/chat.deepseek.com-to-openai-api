@@ -10,6 +10,7 @@ new prompt.
 
 import asyncio
 import tempfile
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, override
@@ -18,7 +19,7 @@ from app.accounts import AccountPool
 from app.conversations import ConversationManager, DeepSeekError
 from app.deepseek import DeepSeekClient
 from app.pow_solver import PowSolver
-from app.storage import Storage
+from app.storage import ConvRef, Storage
 from app.turn import prepare_turn
 
 
@@ -176,6 +177,9 @@ async def test_midstream_failure_recovers_with_full_replay():
         assert client.calls[-1]["chat_session_id"] == "s1"
 
         # Turn 2: upstream commits message 202, then the stream dies mid-answer.
+        # Two scripts: single-account turns now retry once, so both attempts
+        # must die for the turn itself to fail.
+        client.script.append(_ready2_then_die())
         client.script.append(_ready2_then_die())
         try:
             await mgr.run_turn("k", _prepared("q2"), deepthink=False, model_type=None)
@@ -196,7 +200,7 @@ async def test_midstream_failure_recovers_with_full_replay():
         client.script.append(_ready3_ok())
         await mgr.run_turn("k", _prepared("q3"), deepthink=False, model_type=None)
         replay_call = client.calls[-1]
-        assert replay_call["chat_session_id"] == "s2"
+        assert replay_call["chat_session_id"] == "s3"
         prompt = replay_call["prompt"]
         assert "[user] q1" in prompt and "[assistant] a1" in prompt, prompt[:500]
         assert "q2" not in prompt, "failed turn leaked into history"
@@ -306,4 +310,124 @@ async def test_ready_persisted_before_stream_finishes():
                 await task
             except asyncio.CancelledError:
                 pass
+        await mgr.aclose()
+
+
+async def test_single_account_retries_empty_then_replays():
+    """One account must still retry: bare follow-up goes empty, replay succeeds.
+
+    Guards the 9:29 PHT incident (short "Cost?" follow-up failed on its only
+    attempt with history=[] left behind). First attempt sends the bare prompt
+    on the inherited session and gets no RESPONSE fragment; the retry must
+    use a fresh session with the full transcript replayed.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client = _make_manager(tmpdir)
+        assert mgr._pool.size == 1
+
+        client.script.append(_ready_ok())
+        result = await mgr.run_turn(
+            "kr", _prepared("q1"), deepthink=False, model_type=None
+        )
+        assert result.content == "a1"
+
+        # First attempt: empty stream (no RESPONSE fragment). Second: healthy.
+        client.script.append([])
+        client.script.append(_turn(303, "a3"))
+        result2 = await mgr.run_turn(
+            "kr", _prepared("Cost?"), deepthink=False, model_type=None
+        )
+        assert result2.content == "a3"
+        assert len(client.calls) == 3, client.calls
+        replay_prompt = client.calls[-1]["prompt"]
+        assert "[user] q1" in replay_prompt and "[assistant] a1" in replay_prompt
+        assert replay_prompt.rstrip().endswith("Cost?")
+        stored = storage_check(mgr, "kr")
+        assert stored["deepseek_session_id"] == "s2", stored
+        assert stored["parent_message_id"] == 303, stored
+        await mgr.aclose()
+
+
+async def test_stream_single_account_retries_empty():
+    """Streaming variant: pre-emit empty completion retries on fresh session."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client = _make_manager(tmpdir)
+        assert mgr._pool.size == 1
+        client.script.append(_ready_ok())
+        await mgr.run_turn("ks", _prepared("q1"), deepthink=False, model_type=None)
+
+        client.script.append([])
+        client.script.append(_turn(303, "a3"))
+        seen: list[str] = []
+        async for ev in mgr.stream_turn(
+            "ks", _prepared("Cost?"), deepthink=False, model_type=None
+        ):
+            if ev.kind == "content":
+                seen.append(str(ev.value))
+        assert "".join(seen) == "a3", seen
+        assert len(client.calls) == 3, client.calls
+        replay_prompt = client.calls[-1]["prompt"]
+        assert "[user] q1" in replay_prompt and "[assistant] a1" in replay_prompt
+        assert replay_prompt.rstrip().endswith("Cost?")
+        stored = storage_check(mgr, "ks")
+        assert stored["deepseek_session_id"] == "s2", stored
+        assert stored["parent_message_id"] == 303, stored
+        await mgr.aclose()
+
+
+async def test_failed_empty_conversation_leaves_no_row():
+    """A key that never records a turn must not leave a history=[] row."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client = _make_manager(tmpdir)
+        client.script.append([DeepSeekError("boom", status=502)])
+        client.script.append([DeepSeekError("boom again", status=502)])
+        try:
+            await mgr.run_turn(
+                "kjunk", _prepared("Cost?"), deepthink=False, model_type=None
+            )
+            raise AssertionError("expected DeepSeekError")
+        except DeepSeekError:
+            pass
+        assert mgr._storage is not None
+        assert mgr._storage.get_conversation("kjunk") is None
+        assert "kjunk" not in mgr._conversations
+        await mgr.aclose()
+
+
+async def test_failure_invalidates_stale_prefix_refs():
+    """Prefix rows for a dead session must not resurrect it for the next key."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client = _make_manager(tmpdir)
+        assert mgr._storage is not None
+
+        client.script.append(_ready_ok())
+        await mgr.run_turn("kp", _prepared("q1"), deepthink=False, model_type=None)
+        conv = await mgr.get_or_create("kp")
+        dead = conv.deepseek_session_id
+        assert dead is not None
+        mgr._storage.record_prefix_turn(
+            ["hash-dead-follow"],
+            ConvRef(
+                conversation_key="kp",
+                account_index=conv.account_index,
+                account_token=conv.account_token or "",
+                deepseek_session_id=dead,
+                parent_message_id=conv.parent_message_id,
+                turns=1,
+                updated_at=time.time(),
+            ),
+        )
+        assert mgr._storage.find_prefix(["hash-dead-follow"]) is not None
+
+        client.script.append([DeepSeekError("session gone", status=502)])
+        client.script.append(_turn(303, "recovered"))
+        result = await mgr.run_turn(
+            "kp", _prepared("q2"), deepthink=False, model_type=None
+        )
+        assert result.content == "recovered"
+        conn = mgr._storage._get_conn()
+        left = conn.execute(
+            "SELECT COUNT(*) FROM prefixes WHERE deepseek_session_id = ?", (dead,)
+        ).fetchone()[0]
+        assert left == 0, left
         await mgr.aclose()
