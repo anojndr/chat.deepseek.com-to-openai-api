@@ -455,7 +455,7 @@ class DeepSeekClient:
             raise PowChallengeStringError
         if not isinstance(salt, str) or not salt:
             raise PowSaltStringError
-        if not isinstance(expire_at, str | int | float):
+        if isinstance(expire_at, bool) or not isinstance(expire_at, str | int | float):
             raise PowExpireMissingError
         return challenge_hex, salt, expire_at
 
@@ -471,7 +471,7 @@ class DeepSeekClient:
 
         """
         difficulty = challenge.get("difficulty", _POW_DIFFICULTY_DEFAULT)
-        if not isinstance(difficulty, (int, float)):
+        if isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)):
             raise PowDifficultyNumberError
         return difficulty
 
@@ -537,17 +537,11 @@ class DeepSeekClient:
         challenge = self._extract_challenge(payload)
         challenge_hex, salt, expire_at = self._challenge_parts(challenge)
         difficulty = self._challenge_difficulty(challenge)
-        if isinstance(expire_at, str):
-            expire_arg: str | float = expire_at
-        elif isinstance(expire_at, (int, float)):
-            expire_arg = float(expire_at)
-        else:
-            expire_arg = 0.0
         answer = await asyncio.to_thread(
             self._pow.solve,
             challenge_hex,
             salt,
-            expire_arg,
+            expire_at,
             difficulty,
         )
         if answer is None:

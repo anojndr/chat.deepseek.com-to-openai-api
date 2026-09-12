@@ -51,6 +51,29 @@ class WasmAbiError(TypeError):
         self.actual = actual
 
 
+def _expire_str(expire_at: str | float) -> str:
+    """Format a PoW expiry exactly like the DeepSeek web client.
+
+    Args:
+        expire_at: Raw `expire_at` value from the challenge payload. Integer
+            millisecond timestamps arrive here as `int` (assignable to `float`
+            per the numeric tower) and MUST stay integer-formatted: the web
+            client stringifies `1789193300957` without a trailing `.0`, and the
+            wasm hash only matches with that exact prefix.
+
+    Returns:
+        String form used in the `salt_expire_` hash prefix.
+
+    """
+    if isinstance(expire_at, str):
+        return expire_at
+    if isinstance(expire_at, int):
+        return str(expire_at)
+    if expire_at.is_integer():
+        return str(int(expire_at))
+    return str(expire_at)
+
+
 class PowSolver:
     """Solve DeepSeekHashV1 proof-of-work challenges with wasmtime."""
 
@@ -111,6 +134,14 @@ class PowSolver:
     ) -> int | None:
         """Return the integer answer for a DeepSeekHashV1 challenge.
 
+        Args:
+            challenge_hex: Hex challenge string from the backend.
+            salt: Challenge salt from the backend.
+            expire_at: Raw `expire_at` value; integer timestamps stay
+                integer-formatted via `_expire_str` so the wasm prefix matches
+                the web client (no trailing `.0`).
+            difficulty: PoW difficulty from the backend.
+
         Returns:
             int | None: Solution integer, or None when wasm reports no answer.
 
@@ -119,7 +150,7 @@ class PowSolver:
 
         """
         challenge_bytes = challenge_hex.encode()
-        prefix_bytes = f"{salt}_{expire_at}_".encode()
+        prefix_bytes = f"{salt}_{_expire_str(expire_at)}_".encode()
 
         # One wasm call at a time: the Store, its linear memory and the stack
         # pointer are shared mutable state (solve runs on worker threads).
