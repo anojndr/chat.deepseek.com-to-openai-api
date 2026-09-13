@@ -547,9 +547,7 @@ class ConversationManager:
             The prepared turn to send.
 
         """
-        needs_replay = bool(conv.history) and (
-            fresh_session or (not fresh_session and prev_session is None)
-        )
+        needs_replay = bool(conv.history) and (fresh_session or prev_session is None)
         if needs_replay:
             return ConversationManager._replay_prompt(conv, prepared)
         return prepared
@@ -1300,8 +1298,7 @@ class ConversationManager:
         if self._storage is not None:
             data = self._storage.get_conversation(key)
             if data and data.get("history"):
-                history = data["history"]
-                return list(history) if isinstance(history, list) else []
+                return list(data["history"])
         return []
 
     async def reset(self, key: str) -> None:

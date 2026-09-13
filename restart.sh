@@ -19,13 +19,20 @@ for arg in "$@"; do
     esac
 done
 
+PYTHON="python3"
+if [ -x "$DIR/.venv/bin/python3" ]; then
+    PYTHON="$DIR/.venv/bin/python3"
+elif [ -x "$DIR/.venv/bin/python" ]; then
+    PYTHON="$DIR/.venv/bin/python"
+fi
+
 # 1. Stop any running instance (pattern anchored to THIS repo's script path)
-pkill -f "python3 $SERVER" 2>/dev/null || true
+pkill -f "python[0-9.]* $SERVER" 2>/dev/null || true
 for _ in $(seq 1 20); do
-    pgrep -f "python3 $SERVER" >/dev/null 2>&1 || break
+    pgrep -f "python[0-9.]* $SERVER" >/dev/null 2>&1 || break
     sleep 0.5
 done
-if pgrep -f "python3 $SERVER" >/dev/null 2>&1; then
+if pgrep -f "python[0-9.]* $SERVER" >/dev/null 2>&1; then
     echo "[restart] ERROR: old instance still running after 10s; not starting a duplicate." >&2
     exit 1
 fi
@@ -37,7 +44,7 @@ fi
 
 # 2. Start fresh, detached, logging to file
 cd "$DIR"
-setsid nohup python3 "$SERVER" > "$LOG_PATH" 2>&1 < /dev/null &
+setsid nohup "$PYTHON" "$SERVER" > "$LOG_PATH" 2>&1 < /dev/null &
 disown 2>/dev/null || true
 echo "[restart] started (pid $!)"
 

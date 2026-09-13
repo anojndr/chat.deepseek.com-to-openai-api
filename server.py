@@ -7,11 +7,11 @@ Set API_KEY to require `Authorization: Bearer <key>` on generation/admin routes.
 
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 from pathlib import Path
-
-import uvicorn
+from typing import Any
 
 from setup import bootstrap
 
@@ -36,6 +36,7 @@ def main() -> None:
     """Launch the API server."""
     host = os.environ.get("HOST", _DEFAULT_HOST)
     port = int(os.environ.get("PORT", str(_DEFAULT_PORT)))
+    uvicorn: Any = importlib.import_module("uvicorn")
     uvicorn.run(
         "app.main:app",
         host=host,
