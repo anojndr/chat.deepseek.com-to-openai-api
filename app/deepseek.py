@@ -35,6 +35,19 @@ _HTTP_BAD_REQUEST = 400
 _HTTP_OK = 200
 # Backend biz_code meaning the file already satisfies the vision model kind.
 _BIZ_CODE_MODEL_KIND_SATISFIED = 2
+# Completion biz_code meaning the prompt tripped upstream moderation.
+# The site surfaces this as a terminal hint and NEVER retries it: the same
+# prompt sent to another account gets flagged again, so fanning it out
+# across the pool burns every account in turn.
+_BIZ_CODE_MUTED = 5
+# Global biz_code meaning the account itself is muted/suspended.
+_BIZ_CODE_GLOBAL_MUTED = 50006
+# Upload biz_code meaning the file tripped upstream moderation.
+_BIZ_CODE_UPLOAD_MUTED = 14
+# Completion biz_codes that reject the request shape itself (bad session,
+# unknown parent, empty prompt, ...). The site surfaces these as terminal
+# hints/toasts without retrying; another account would fail identically.
+_NON_RETRYABLE_COMPLETION_CODES = frozenset({1, 2, 3, 6, 9, 10, 26, 28})
 # Poll interval while waiting for file parse to leave PENDING/PARSING.
 _FILE_POLL_INTERVAL_S = 0.4
 # Timeouts for file-parse waits.
@@ -51,7 +64,7 @@ _COMPLETION_SNIPPET_LEN = 300
 
 _CLIENT_HEADERS = {
     "x-client-platform": "web",
-    "x-client-version": "2.4.0",
+    "x-client-version": "2.5.0",
     "x-client-locale": "en_US",
     "x-client-bundle-id": "com.deepseek.chat",
     "referer": f"{BASE_URL}/a/chat/",
@@ -59,7 +72,11 @@ _CLIENT_HEADERS = {
 }
 
 # File statuses that end the parse wait.
-_TERMINAL_FILE_STATUSES = frozenset({"SUCCESS", "CONTENT_EMPTY", "ERROR", "REJECTED"})
+_TERMINAL_FILE_STATUSES = frozenset(
+    {"SUCCESS", "CONTENT_EMPTY", "ERROR", "REJECTED", "CONTENT_FILTER"},
+)
+# File verdicts that refuse retry: the file itself was flagged.
+_MODERATION_FILE_STATUSES = frozenset({"CONTENT_FILTER", "REJECTED"})
 # File statuses that allow the vision fast path to continue.
 _VISION_OK_STATUSES = frozenset({"SUCCESS", "CONTENT_EMPTY"})
 # Success codes for the outer and inner biz envelopes.
@@ -138,6 +155,39 @@ class DeepSeekNonJsonError(DeepSeekError):
 
 class DeepSeekBizCodeError(DeepSeekError):
     """Raised when the backend biz envelope carries an error code."""
+
+    def __init__(self, context: str, code: object, detail: object) -> None:
+        """Build message from context, code, and detail."""
+        code_int = code if isinstance(code, int) else None
+        super().__init__(f"{context}: {detail}", biz_code=code_int)
+        self.context = context
+        self.detail = detail
+
+
+class ModerationError(DeepSeekError):
+    """Refuse to retry a turn the backend flagged as a policy violation."""
+
+    def __init__(self, context: str, code: object, detail: object) -> None:
+        """Build message from context, code, and detail."""
+        code_int = code if isinstance(code, int) else None
+        super().__init__(f"{context}: {detail}", biz_code=code_int)
+        self.context = context
+        self.detail = detail
+
+
+class AccountMutedError(DeepSeekError):
+    """Signal the account itself is muted/suspended."""
+
+    def __init__(self, context: str, code: object, detail: object) -> None:
+        """Build message from context, code, and detail."""
+        code_int = code if isinstance(code, int) else None
+        super().__init__(f"{context}: {detail}", biz_code=code_int)
+        self.context = context
+        self.detail = detail
+
+
+class NonRetryableCompletionError(DeepSeekError):
+    """Signal a completion the backend rejected deterministically."""
 
     def __init__(self, context: str, code: object, detail: object) -> None:
         """Build message from context, code, and detail."""
@@ -277,6 +327,27 @@ class UploadInitialParseError(DeepSeekError):
         self.file_status = status
 
 
+class UploadModerationError(DeepSeekError):
+    """Refuse to retry a file the backend flagged as a policy violation."""
+
+    def __init__(
+        self,
+        context: str,
+        code: object,
+        detail: object,
+        *,
+        fid: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        """Build message from context, code, and detail."""
+        code_int = code if isinstance(code, int) else None
+        super().__init__(f"{context}: {detail}", biz_code=code_int)
+        self.context = context
+        self.detail = detail
+        self.fid = fid
+        self.file_status = status
+
+
 class ForkMissingIdError(DeepSeekError):
     """Raised when fork_file_task omits the new file id."""
 
@@ -372,6 +443,35 @@ class DeepSeekClient:
             return decoded
 
     @staticmethod
+    def _classified_biz_error(
+        context: str,
+        code: object,
+        detail: object,
+    ) -> DeepSeekError:
+        """Build the narrowest error for a backend biz code.
+
+        Args:
+            context: Envelope that produced the code.
+            code: Raw backend code value.
+            detail: Backend message or payload.
+
+        Returns:
+            Moderation, mute, or deterministic-rejection error when the code
+            is one the web client treats as terminal; plain biz error else.
+
+        """
+        code_int = code if isinstance(code, int) else None
+        if code_int == _BIZ_CODE_MUTED:
+            return ModerationError(context, code, detail)
+        if code_int == _BIZ_CODE_GLOBAL_MUTED:
+            return AccountMutedError(context, code, detail)
+        if context == "upload_file" and code_int == _BIZ_CODE_UPLOAD_MUTED:
+            return UploadModerationError(context, code, detail)
+        if context == "completion" and code_int in _NON_RETRYABLE_COMPLETION_CODES:
+            return NonRetryableCompletionError(context, code, detail)
+        return DeepSeekBizCodeError(context, code, detail)
+
+    @staticmethod
     def _check_biz(payload: dict[str, Any], context: str) -> dict[str, Any]:
         """Validate biz envelopes and return biz_data.
 
@@ -379,25 +479,61 @@ class DeepSeekClient:
             The biz_data object.
 
         Raises:
-            DeepSeekBizCodeError: If outer or inner codes signal failure.
             DeepSeekBizDataMissingError: If biz_data is absent.
 
         """
         if payload.get("code") not in _OK_BIZ_CODES:
-            raise DeepSeekBizCodeError(
+            error = DeepSeekClient._classified_biz_error(
                 context,
                 payload.get("code"),
                 payload.get("msg") or payload,
             )
+            raise error
         data = payload.get("data") or {}
         biz_code = data.get("biz_code") if isinstance(data, dict) else None
         if biz_code not in _OK_BIZ_CODES:
             detail = data.get("biz_msg") or data if isinstance(data, dict) else data
-            raise DeepSeekBizCodeError(context, biz_code, detail)
+            error = DeepSeekClient._classified_biz_error(context, biz_code, detail)
+            raise error
         biz_data = data.get("biz_data") if isinstance(data, dict) else None
         if not isinstance(biz_data, dict):
             raise DeepSeekBizDataMissingError(context)
         return biz_data
+
+    @staticmethod
+    def _completion_json_error(payload: object) -> DeepSeekError | None:
+        """Map a non-stream completion envelope to an error, if it is one.
+
+        The backend answers deterministic rejections (bad session, unknown
+        parent, empty prompt, moderation mute) as HTTP 200 application/json
+        instead of an SSE stream. The web client surfaces those as terminal
+        hints without retrying.
+
+        Args:
+            payload: Decoded body or one SSE event data.
+
+        Returns:
+            The narrowest error for the envelope, or None when the payload
+            is not a completion error envelope.
+
+        """
+        if not isinstance(payload, dict):
+            return None
+        outer = payload.get("code")
+        if outer not in _OK_BIZ_CODES:
+            return DeepSeekClient._classified_biz_error(
+                "completion",
+                outer,
+                payload.get("msg") or payload,
+            )
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return None
+        biz_code = data.get("biz_code")
+        if not isinstance(biz_code, int) or biz_code in _OK_BIZ_CODES:
+            return None
+        detail = data.get("biz_msg") or data
+        return DeepSeekClient._classified_biz_error("completion", biz_code, detail)
 
     @staticmethod
     def _require(biz: dict[str, Any], key: str, context: str) -> object:
@@ -672,6 +808,16 @@ class DeepSeekClient:
 
         """
         status = await self._wait_file_terminal(fid, seconds)
+        if status in _MODERATION_FILE_STATUSES:
+            detail = f"file {fid} flagged (status={status})"
+            error = UploadModerationError(
+                "upload_file",
+                None,
+                detail,
+                fid=fid,
+                status=status,
+            )
+            raise error
         if status != "SUCCESS":
             raise UploadProcessingError(fid, status)
 
@@ -807,6 +953,16 @@ class DeepSeekClient:
 
         """
         st = await self._wait_file_terminal(file_id, _FILE_WAIT_INITIAL_S)
+        if st in _MODERATION_FILE_STATUSES:
+            detail = f"file {file_id} flagged (status={st})"
+            error = UploadModerationError(
+                "upload_file",
+                None,
+                detail,
+                fid=file_id,
+                status=st,
+            )
+            raise error
         if st not in _VISION_OK_STATUSES:
             raise UploadInitialParseError(st)
         if self._is_vision_kind(biz):
@@ -1013,7 +1169,22 @@ class DeepSeekClient:
             if response.status_code != _HTTP_OK:
                 text = (await response.aread()).decode(errors="replace")
                 raise CompletionHttpError(response.status_code, text)
+            headers = getattr(response, "headers", None)
+            content_type = headers.get("content-type", "") if headers else ""
+            if headers is not None and "text/event-stream" not in content_type:
+                text = (await response.aread()).decode(errors="replace")
+                try:
+                    payload: object = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise CompletionHttpError(response.status_code, text) from exc
+                error = self._completion_json_error(payload)
+                if error is not None:
+                    raise error
+                raise CompletionHttpError(response.status_code, text)
             async for event in self._iter_sse_events(response):
+                error = self._completion_json_error(event.get("data"))
+                if error is not None:
+                    raise error
                 yield event
         finally:
             await response.aclose()

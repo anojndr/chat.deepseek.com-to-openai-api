@@ -21,7 +21,14 @@ import httpx
 
 from .aggregator import FragmentAggregator
 from .citations import CitationRewriter, rewrite_citations
-from .deepseek import DeepSeekClient, DeepSeekError
+from .deepseek import (
+    AccountMutedError,
+    DeepSeekClient,
+    DeepSeekError,
+    ModerationError,
+    NonRetryableCompletionError,
+    UploadModerationError,
+)
 from .storage import ConvRef, Storage
 from .turn import PreparedTurn, item_hash
 
@@ -45,6 +52,28 @@ _THINK_FRAGMENT = "THINK"
 _RESPONSE_FRAGMENTS = frozenset({"", "RESPONSE"})
 # Stream event kinds emitted as content deltas.
 _CONTENT_KINDS = frozenset({"content", "reasoning"})
+# Turn failures the web client treats as terminal: moderation mutes and
+# deterministic request rejections. Retrying them on the next account
+# re-sends the same flagged prompt, burning every account in turn.
+_TERMINAL_TURN_ERRORS = (
+    ModerationError,
+    AccountMutedError,
+    NonRetryableCompletionError,
+    UploadModerationError,
+)
+
+
+def _is_terminal_turn_error(exc: BaseException) -> bool:
+    """Check whether a turn failure must not rotate accounts.
+
+    Args:
+        exc: Failure from one turn attempt.
+
+    Returns:
+        True for moderation mutes and deterministic rejections.
+
+    """
+    return isinstance(exc, _TERMINAL_TURN_ERRORS)
 
 
 class RunTurnOptions(TypedDict):
@@ -690,12 +719,19 @@ class ConversationManager:
     ) -> TurnResult:
         """Run one locked turn with retries.
 
+        Terminal moderation and rejection failures raise immediately
+        without rotating accounts.
+
         Returns:
             The turn result.
 
         Raises:
+            AccountMutedError: If the account is muted.
             CancelledError: If cancelled.
+            ModerationError: If the prompt tripped moderation.
+            NonRetryableCompletionError: If the turn is rejected terminally.
             TurnExhaustedError: If all accounts fail.
+            UploadModerationError: If a file tripped moderation.
 
         """
         conv = await self.get_or_create(key)
@@ -729,6 +765,14 @@ class ConversationManager:
                 last_error = exc
                 self._empty_turn(conv, key, attempt, attempts, exc)
                 continue
+            except (AccountMutedError, UploadModerationError) as exc:
+                self._fail_turn(conv, attempt, attempts, account_token, exc)
+                await self._drop_if_empty(conv)
+                raise
+            except (ModerationError, NonRetryableCompletionError) as exc:
+                self._fail_turn(conv, attempt, attempts, None, exc)
+                await self._drop_if_empty(conv)
+                raise
             except (
                 DeepSeekError,
                 httpx.HTTPError,
@@ -792,11 +836,22 @@ class ConversationManager:
     ) -> DeepSeekError | None:
         """Handle a stream setup failure with rotation bookkeeping.
 
+        Terminal moderation and rejection failures raise immediately: the
+        same prompt would be flagged again on the next account.
+
         Returns:
             The updated last backend error.
 
         """
         attempt, attempts = progress
+        if _is_terminal_turn_error(exc):
+            poisoned = (
+                account_token
+                if isinstance(exc, (AccountMutedError, UploadModerationError))
+                else None
+            )
+            self._fail_turn(conv, attempt, attempts, poisoned, exc)
+            raise exc
         if isinstance(exc, DeepSeekError):
             last_ds = exc
         if account_token:
@@ -976,6 +1031,9 @@ class ConversationManager:
     ) -> DeepSeekError | None:
         """Handle a stream failure, raising on interruption.
 
+        Terminal moderation and rejection failures raise immediately when
+        nothing was emitted yet: retrying re-sends the flagged prompt.
+
         Returns:
             The updated last backend error.
 
@@ -983,6 +1041,14 @@ class ConversationManager:
             StreamInterruptedError: If content was already emitted.
 
         """
+        if _is_terminal_turn_error(ctx.exc) and not ctx.emitted:
+            poisoned = (
+                ctx.account_token
+                if isinstance(ctx.exc, (AccountMutedError, UploadModerationError))
+                else None
+            )
+            self._fail_turn(conv, ctx.attempt, ctx.attempts, poisoned, ctx.exc)
+            raise ctx.exc
         if isinstance(ctx.exc, DeepSeekError):
             ctx.last_ds = ctx.exc
         if ctx.account_token:

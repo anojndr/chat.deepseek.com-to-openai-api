@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Unpack, override
 
 from app.accounts import AccountPool
-from app.conversations import ConversationManager, DeepSeekError
+from app.conversations import (
+    AccountMutedError,
+    ConversationManager,
+    DeepSeekError,
+    ModerationError,
+    NonRetryableCompletionError,
+    UploadModerationError,
+)
 from app.deepseek import CompletionOptions, DeepSeekClient
 from app.pow_solver import PowSolver
 from app.storage import ConversationRow, ConvRef, Storage
@@ -80,6 +87,8 @@ class FakeDeepSeekClient(DeepSeekClient):
         )
         self.calls: list[dict[str, Any]] = []
         self.sessions: list[str] = []
+        self.upload_script: list[str | BaseException] = []
+        self.upload_calls: list[dict[str, Any]] = []
 
     @override
     async def create_session(self) -> str:
@@ -102,12 +111,23 @@ class FakeDeepSeekClient(DeepSeekClient):
         *,
         vision: bool = False,
     ) -> str:
-        """Reject unexpected uploads.
+        """Replay a queued upload script when present.
+
+        Returns:
+            The canned file id.
 
         Raises:
-            AssertionError: Always raised.
+            AssertionError: If no upload script is queued or mistyped.
 
         """
+        if self.upload_script:
+            item = self.upload_script.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            if not isinstance(item, str):
+                msg = "upload script must hold ids"
+                raise AssertionError(msg)
+            return item
         msg = "no files expected"
         raise AssertionError(msg)
 
@@ -236,6 +256,34 @@ def _make_manager(
 
     mgr.__dict__["_clients"] = {_FAKE_ID: client}
     return mgr, client, storage, pool
+
+
+def _make_multi_manager(
+    tmpdir: str,
+    tokens: int = 3,
+) -> tuple[ConversationManager, list[FakeDeepSeekClient], Storage, AccountPool]:
+    """Build manager with one fake client per account.
+
+    Args:
+        tmpdir: Scratch directory for sqlite and accounts.
+        tokens: Number of fake accounts to create.
+
+    Returns:
+        Manager, per-token clients, storage, and pool.
+
+    """
+    db_path = Path(tmpdir) / "t.sqlite"
+    accounts_path = Path(tmpdir) / "accounts.txt"
+    lines = "".join(
+        f'account {i + 1}\n{{"userToken": "tok{i + 1}"}}\n' for i in range(tokens)
+    )
+    accounts_path.write_text(lines)
+    pool = AccountPool(accounts_path)
+    storage = Storage(db_path)
+    mgr = ConversationManager(pool, DummySolver(), storage=storage)
+    clients = [FakeDeepSeekClient(f"tok{i + 1}") for i in range(tokens)]
+    mgr.__dict__["_clients"] = {c.token: c for c in clients}
+    return mgr, clients, storage, pool
 
 
 def _prepared(text: str) -> PreparedTurn:
@@ -637,6 +685,194 @@ async def test_failure_invalidates_stale_prefix_refs() -> None:
         if storage.find_prefix(["hash-dead-follow"]) is not None:
             msg = "dead prefix should be gone"
             raise AssertionError(msg)
+        await mgr.aclose()
+
+
+async def test_moderation_does_not_rotate_accounts() -> None:
+    """Check a flagged prompt fails fast on the first account.
+
+    Raises:
+        AssertionError: If failover re-sends the flagged prompt.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, pool = _make_multi_manager(tmpdir)
+        clients[0].script.append(
+            [ModerationError("completion", 5, "muted")],
+        )
+        clients[1].script.append(_ready_ok())
+        clients[2].script.append(_ready_ok())
+        try:
+            await mgr.run_turn(
+                "kmod",
+                _prepared("q1"),
+                deepthink=False,
+                model_type=None,
+            )
+        except ModerationError:
+            pass
+        else:
+            msg = "expected ModerationError"
+            raise AssertionError(msg)
+        _check_equal(len(clients[0].calls), 1, "first account calls")
+        _check_equal(len(clients[1].calls), 0, "second account calls")
+        _check_equal(len(clients[2].calls), 0, "third account calls")
+        for entry in pool.snapshot():
+            _check_equal(entry["consecutive_failures"], 0, "pool unpoisoned")
+        await mgr.aclose()
+
+
+async def test_muted_account_is_quarantined_without_fanout() -> None:
+    """Check a muted token cools down while the turn still fails fast.
+
+    Raises:
+        AssertionError: If the muted token stays eligible or failover runs.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, pool = _make_multi_manager(tmpdir)
+        clients[0].script.append(
+            [AccountMutedError("completion", 50006, "muted")],
+        )
+        clients[1].script.append(_ready_ok())
+        try:
+            await mgr.run_turn(
+                "kmute",
+                _prepared("q1"),
+                deepthink=False,
+                model_type=None,
+            )
+        except AccountMutedError:
+            pass
+        else:
+            msg = "expected AccountMutedError"
+            raise AssertionError(msg)
+        _check_equal(len(clients[0].calls), 1, "muted account calls")
+        _check_equal(len(clients[1].calls), 0, "next account calls")
+        muted = pool.by_token("tok1")
+        if muted is None or muted.failures != 1:
+            msg = "muted token should cool down"
+            raise AssertionError(msg)
+        await mgr.aclose()
+
+
+async def test_deterministic_rejection_does_not_rotate() -> None:
+    """Check a bad-parent rejection fails fast without pool poison.
+
+    Raises:
+        AssertionError: If failover re-sends the rejected turn.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, pool = _make_multi_manager(tmpdir)
+        clients[0].script.append(
+            [NonRetryableCompletionError("completion", 26, "invalid message id")],
+        )
+        clients[1].script.append(_ready_ok())
+        try:
+            await mgr.run_turn(
+                "kbad",
+                _prepared("q1"),
+                deepthink=False,
+                model_type=None,
+            )
+        except NonRetryableCompletionError:
+            pass
+        else:
+            msg = "expected NonRetryableCompletionError"
+            raise AssertionError(msg)
+        _check_equal(len(clients[0].calls), 1, "first account calls")
+        _check_equal(len(clients[1].calls), 0, "second account calls")
+        for entry in pool.snapshot():
+            _check_equal(entry["consecutive_failures"], 0, "pool unpoisoned")
+        await mgr.aclose()
+
+
+async def test_upload_moderation_quarantines_token_without_fanout() -> None:
+    """Check a flagged file fails fast and cools down its account.
+
+    Raises:
+        AssertionError: If the flagged file is re-uploaded elsewhere.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, pool = _make_multi_manager(tmpdir)
+        flagged = UploadModerationError(
+            "upload_file",
+            14,
+            "muted",
+            fid="f1",
+            status="REJECTED",
+        )
+        clients[0].upload_script.append(flagged)
+        clients[0].script.append(_ready_ok())
+        clients[1].script.append(_ready_ok())
+        prepared = prepare_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file": {"filename": "a.txt"},
+                            "file_data": "data:text/plain;base64,aGk=",
+                        },
+                    ],
+                },
+            ],
+            is_first_turn=True,
+        )
+        try:
+            await mgr.run_turn(
+                "kfile",
+                prepared,
+                deepthink=False,
+                model_type=None,
+            )
+        except UploadModerationError:
+            pass
+        else:
+            msg = "expected UploadModerationError"
+            raise AssertionError(msg)
+        _check_equal(len(clients[0].calls), 0, "no completion calls")
+        _check_equal(len(clients[1].calls), 0, "no failover calls")
+        flagged_token = pool.by_token("tok1")
+        if flagged_token is None or flagged_token.failures != 1:
+            msg = "flagged token should cool down"
+            raise AssertionError(msg)
+        await mgr.aclose()
+
+
+async def test_stream_moderation_does_not_rotate() -> None:
+    """Check a pre-emit stream mute fails fast on the first account.
+
+    Raises:
+        AssertionError: If failover re-sends the flagged prompt.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, pool = _make_multi_manager(tmpdir, tokens=2)
+        clients[0].script.append(
+            [ModerationError("completion", 5, "muted")],
+        )
+        clients[1].script.append(_ready_ok())
+        try:
+            async for _ in mgr.stream_turn(
+                "kstream",
+                _prepared("q1"),
+                deepthink=False,
+                model_type=None,
+            ):
+                pass
+        except ModerationError:
+            pass
+        else:
+            msg = "expected ModerationError"
+            raise AssertionError(msg)
+        _check_equal(len(clients[0].calls), 1, "first account calls")
+        _check_equal(len(clients[1].calls), 0, "second account calls")
+        for entry in pool.snapshot():
+            _check_equal(entry["consecutive_failures"], 0, "pool unpoisoned")
         await mgr.aclose()
 
 

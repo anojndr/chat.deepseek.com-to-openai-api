@@ -19,12 +19,17 @@ from test_storage import test_conversation_manager_persistence, test_storage_bas
 from test_stream_stall import TestStreamStall
 from test_turn_recovery import (
     test_cancelled_stream_drops_session,
+    test_deterministic_rejection_does_not_rotate,
     test_failed_empty_conversation_leaves_no_row,
     test_failure_invalidates_stale_prefix_refs,
     test_midstream_failure_recovers_with_full_replay,
+    test_moderation_does_not_rotate_accounts,
+    test_muted_account_is_quarantined_without_fanout,
     test_ready_persisted_before_stream_finishes,
     test_single_account_retries_empty_then_replays,
+    test_stream_moderation_does_not_rotate,
     test_stream_single_account_retries_empty,
+    test_upload_moderation_quarantines_token_without_fanout,
 )
 from test_unified_model import TestUnifiedFileTurns, TestUnifiedModel
 from test_user_scenario import TestUserScenario
@@ -96,6 +101,31 @@ class TestSQLitePersistence(unittest.TestCase):
     def test_stale_prefix_invalidated() -> None:
         """Check stale prefix invalidation."""
         asyncio.run(test_failure_invalidates_stale_prefix_refs())
+
+    @staticmethod
+    def test_moderation_no_rotation() -> None:
+        """Check moderation fails fast without rotation."""
+        asyncio.run(test_moderation_does_not_rotate_accounts())
+
+    @staticmethod
+    def test_muted_quarantine_no_fanout() -> None:
+        """Check muted token cools down without fanout."""
+        asyncio.run(test_muted_account_is_quarantined_without_fanout())
+
+    @staticmethod
+    def test_deterministic_no_rotation() -> None:
+        """Check deterministic rejection fails fast."""
+        asyncio.run(test_deterministic_rejection_does_not_rotate())
+
+    @staticmethod
+    def test_upload_moderation_quarantine() -> None:
+        """Check flagged file fails fast with quarantine."""
+        asyncio.run(test_upload_moderation_quarantines_token_without_fanout())
+
+    @staticmethod
+    def test_stream_moderation_no_rotation() -> None:
+        """Check stream moderation fails fast."""
+        asyncio.run(test_stream_moderation_does_not_rotate())
 
 
 if __name__ == "__main__":

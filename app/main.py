@@ -19,7 +19,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .accounts import AccountPool
 from .citations import source_appendix
 from .conversations import ConversationManager, StreamEvent, TurnResult
-from .deepseek import DeepSeekError
+from .deepseek import (
+    _BIZ_CODE_GLOBAL_MUTED,
+    _BIZ_CODE_MUTED,
+    _NON_RETRYABLE_COMPLETION_CODES,
+    DeepSeekError,
+)
 from .models import ChatCompletionRequest, ModelSpec, ResponsesRequest, parse_model
 from .pow_solver import PowSolver
 from .storage import ConvRef, Storage
@@ -33,7 +38,9 @@ if TYPE_CHECKING:
 # HTTP status codes returned by this proxy.
 _HTTP_BAD_REQUEST = 400
 _HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
 _HTTP_NOT_FOUND = 404
+_HTTP_UNPROCESSABLE = 422
 _HTTP_RATE_LIMITED = 429
 _HTTP_BAD_GATEWAY = 502
 
@@ -44,6 +51,10 @@ _HTTP_ERROR_MAX = 600
 # Upstream business codes mapped to dedicated statuses.
 _AUTH_FAILURE_BIZ_CODES: frozenset[int] = frozenset({40002, 40003})
 _RATE_LIMIT_BIZ_CODE = 40029
+# Single source of truth lives in app.deepseek; these aliases keep the
+# HTTP mapping readable next to the status table.
+_MUTED_BIZ_CODES: frozenset[int] = frozenset({_BIZ_CODE_MUTED, _BIZ_CODE_GLOBAL_MUTED})
+_UNPROCESSABLE_BIZ_CODES: frozenset[int] = _NON_RETRYABLE_COMPLETION_CODES
 
 # Truthy tokens for the include-sources flags.
 _TRUTHY_TOKENS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
@@ -56,6 +67,7 @@ _ERROR_UPSTREAM = "upstream_error"
 _ERROR_INVALID_REQUEST = "invalid_request_error"
 _ERROR_INVALID_API_KEY = "invalid_api_key"
 _ERROR_RATE_LIMIT = "rate_limit_exceeded"
+_ERROR_MODERATION = "moderation_blocked"
 
 
 class MissingApiKeyError(Exception):
@@ -418,6 +430,12 @@ def _http_error(exc: DeepSeekError) -> JSONResponse:
     elif exc.biz_code == _RATE_LIMIT_BIZ_CODE:
         mapped = _HTTP_RATE_LIMITED
         etype = _ERROR_RATE_LIMIT
+    elif exc.biz_code in _MUTED_BIZ_CODES:
+        mapped = _HTTP_FORBIDDEN
+        etype = _ERROR_MODERATION
+    elif exc.biz_code in _UNPROCESSABLE_BIZ_CODES:
+        mapped = _HTTP_UNPROCESSABLE
+        etype = _ERROR_INVALID_REQUEST
     else:
         if _HTTP_ERROR_MIN <= status < _HTTP_ERROR_MAX:
             mapped = status
