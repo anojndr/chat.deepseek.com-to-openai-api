@@ -341,6 +341,33 @@ class TestBranchingAndIsolation(unittest.TestCase):
         self._check_status(r3_b.status_code)
         self._check_call(sess1, _PARENT_TURN_THREE)
 
+    def test_previous_response_id_survives_restart(self) -> None:
+        """Verify a chained follow-up resolves after an in-memory wipe."""
+        r1 = self.client.post(
+            "/v1/responses",
+            json={"model": "deepseek-chat", "input": "explain thematic rrl"},
+        )
+        self._check_status(r1.status_code)
+        first_id = r1.json()["id"]
+        sess1 = self.fake_client.created_sessions[0]
+
+        # Simulate a process restart: drop in-memory conversations and
+        # response links, keeping only SQLite rows.
+        self.manager.test_hook_drop_memory()
+        main_mod.test_hook_clear_response_links()
+        r2 = self.client.post(
+            "/v1/responses",
+            json={
+                "model": "deepseek-chat",
+                "input": "what sections to avoid",
+                "previous_response_id": first_id,
+            },
+        )
+        self._check_status(r2.status_code)
+        # Same pinned DeepSeek session continues the native chain.
+        self._check_session_count(_ONE_SESSION)
+        self._check_call(sess1, _PARENT_TURN_TWO)
+
 
 if __name__ == "__main__":
     unittest.main()

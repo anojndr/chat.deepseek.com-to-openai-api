@@ -350,6 +350,10 @@ class ConversationManager:
         """Inject a client for tests via the public hook."""
         self._clients[token] = client
 
+    def test_hook_drop_memory(self) -> None:
+        """Drop in-memory conversations, keeping SQLite rows for reload."""
+        self._conversations.clear()
+
     async def test_hook_stream_events(
         self,
         client: DeepSeekClient,

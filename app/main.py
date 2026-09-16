@@ -651,7 +651,12 @@ def _resolve_previous_key(
     """
     if response_id is None:
         return fallback
-    stored = _response_links.get(response_id)
+    stored: dict[str, Any] | None = _response_links.get(response_id)
+    if stored is None:
+        link = _active_storage().get_response_link(response_id)
+        if link is not None:
+            stored = {"conversation": link["conversation"], "model": link["model"]}
+            _response_links[response_id] = stored
     if stored is None:
         return _error(
             f"previous_response_id {response_id} not found",
