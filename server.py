@@ -34,8 +34,12 @@ _bootstrap()
 
 def main() -> None:
     """Launch the API server."""
-    host = os.environ.get("HOST", _DEFAULT_HOST)
-    port = int(os.environ.get("PORT", str(_DEFAULT_PORT)))
+    # Namespaced env first (DEEPSEEK_*); generic HOST/PORT last so a sibling
+    # bridge's exported PORT can never rebind this server.
+    host = os.environ.get("DEEPSEEK_HOST", os.environ.get("HOST", _DEFAULT_HOST))
+    port = int(
+        os.environ.get("DEEPSEEK_PORT", os.environ.get("PORT", str(_DEFAULT_PORT))),
+    )
     uvicorn: Any = importlib.import_module("uvicorn")
     uvicorn.run(
         "app.main:app",

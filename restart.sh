@@ -7,7 +7,8 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT=34868
+# Namespaced env first; a sibling bridge's exported PORT must never rebind us.
+PORT="${DEEPSEEK_PORT:-${PORT:-34868}}"
 SERVER="$DIR/server.py"
 LOG_PATH="$DIR/server.log"
 

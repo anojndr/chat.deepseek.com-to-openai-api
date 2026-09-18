@@ -87,12 +87,21 @@ class StartupError(RuntimeError):
 
 
 ROOT = Path(__file__).resolve().parent.parent
-ACCOUNTS_PATH = Path(
-    "/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt",
-)
-if not ACCOUNTS_PATH.exists():
-    ACCOUNTS_PATH = ROOT / "accounts.txt"
-DB_PATH = ROOT / "data.sqlite"
+# Namespaced env first (DEEPSEEK_*), generic fallbacks last — a bare
+# DB_PATH/API_KEY exported for a sibling bridge must never hijack this one.
+# An explicit DEEPSEEK_ACCOUNTS_FILE always wins, even if the file does not
+# exist yet — falling back silently would hide a misconfigured path.
+_ACCOUNTS_ENV = os.environ.get("DEEPSEEK_ACCOUNTS_FILE", "")
+if _ACCOUNTS_ENV:
+    ACCOUNTS_PATH = Path(_ACCOUNTS_ENV)
+else:
+    ACCOUNTS_PATH = Path(
+        "/home/sweetpotet/Desktop/chat.deepseek.com-to-openai-api/accounts.txt",
+    )
+    if not ACCOUNTS_PATH.exists():
+        ACCOUNTS_PATH = ROOT / "accounts.txt"
+_DEEPSEEK_DB = os.environ.get("DEEPSEEK_DB_PATH", "")
+DB_PATH = Path(_DEEPSEEK_DB) if _DEEPSEEK_DB else ROOT / "data.sqlite"
 
 _pool = AccountPool(ACCOUNTS_PATH)
 # Legacy aliases retained for backward compatibility with direct assignment
@@ -293,7 +302,7 @@ def test_hook_get_response_links() -> dict[str, dict[str, str]]:
     }
 
 
-API_KEY: str | None = os.environ.get("API_KEY")
+API_KEY: str | None = os.environ.get("DEEPSEEK_API_KEY", os.environ.get("API_KEY"))
 _INCLUDE_SOURCES_RAW = os.environ.get("DEEPSEEK_INCLUDE_SOURCES")
 if _INCLUDE_SOURCES_RAW is None:
     _INCLUDE_SOURCES_RAW = os.environ.get("INCLUDE_SOURCES", "0")
