@@ -876,5 +876,155 @@ async def test_stream_moderation_does_not_rotate() -> None:
         await mgr.aclose()
 
 
+async def test_followup_failover_replays_without_account_affinity() -> None:
+    """Check follow-up failover replays history on a fresh account.
+
+    Raises:
+        AssertionError: If replay misses history or sticks to dead account.
+        TypeError: If prompt shape is invalid.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, _pool = _make_multi_manager(tmpdir, tokens=2)
+        clients[0].script.append(_ready_ok())
+        result = await mgr.run_turn(
+            "kstick",
+            _prepared("q1"),
+            deepthink=False,
+            model_type=None,
+        )
+        _check_equal(result.content, _TEXT_FIRST, "content")
+        conv = await mgr.get_or_create("kstick")
+        _check_equal(conv.account_token, "tok1", "pinned account")
+        clients[0].script.append([DeepSeekError("account gone", status=502)])
+        clients[1].script.append(_turn(_RID_RECOVERED, _TEXT_THIRD))
+        result2 = await mgr.run_turn(
+            "kstick",
+            _prepared("q2"),
+            deepthink=False,
+            model_type=None,
+        )
+        _check_equal(result2.content, _TEXT_THIRD, "recovered")
+        _check_equal(len(clients[0].calls), 2, "dead account calls")
+        _check_equal(len(clients[1].calls), 1, "failover calls")
+        replay_call = clients[1].calls[0]
+        _check_equal(replay_call["chat_session_id"], "s1", "replay session")
+        prompt = replay_call["prompt"]
+        if not isinstance(prompt, str):
+            msg = "prompt must be str"
+            raise TypeError(msg)
+        _check_contains(prompt, "[user] q1", "replay q1")
+        _check_contains(prompt, "[assistant] a1", "replay a1")
+        if not prompt.rstrip().endswith("q2"):
+            msg = "replay should end with q2"
+            raise AssertionError(msg)
+        _check_is_none(replay_call["parent_message_id"], "replay parent")
+        conv = await mgr.get_or_create("kstick")
+        _check_equal(conv.account_token, "tok2", "moved account")
+        await mgr.aclose()
+
+
+async def test_followup_stays_sticky_without_failover() -> None:
+    """Check healthy follow-ups reuse the pinned account session."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, _pool = _make_multi_manager(tmpdir, tokens=2)
+        clients[0].script.append(_ready_ok())
+        await mgr.run_turn(
+            "kpin",
+            _prepared("q1"),
+            deepthink=False,
+            model_type=None,
+        )
+        clients[0].script.append(_turn(_RID_PARTIAL, _TEXT_PARTIAL))
+        result = await mgr.run_turn(
+            "kpin",
+            _prepared("q2"),
+            deepthink=False,
+            model_type=None,
+        )
+        _check_equal(result.content, _TEXT_PARTIAL, "content")
+        _check_equal(len(clients[0].calls), 2, "pinned calls")
+        _check_equal(len(clients[1].calls), 0, "other account untouched")
+        followup = clients[0].calls[1]
+        _check_equal(followup["chat_session_id"], "s1", "pinned session")
+        _check_equal(followup["parent_message_id"], _RID_FIRST, "parent chain")
+        _check_equal(followup["prompt"], "q2", "incremental prompt")
+        conv = await mgr.get_or_create("kpin")
+        _check_equal(conv.account_token, "tok1", "pinned account")
+        await mgr.aclose()
+
+
+async def test_first_turn_failover_replays_without_double_labels() -> None:
+    """Check first-turn retry does not nest role labels.
+
+    Raises:
+        TypeError: If prompt shape is invalid.
+
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, clients, _storage, _pool = _make_multi_manager(tmpdir, tokens=2)
+        full = prepare_turn(
+            [
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "user", "content": "q2"},
+            ],
+            is_first_turn=True,
+        )
+        clients[0].script.append([DeepSeekError("account gone", status=502)])
+        clients[1].script.append(_turn(_RID_FIRST, _TEXT_FIRST))
+        result = await mgr.run_turn(
+            "kfirst",
+            full,
+            deepthink=False,
+            model_type=None,
+        )
+        _check_equal(result.content, _TEXT_FIRST, "content")
+        replay_call = clients[1].calls[0]
+        prompt = replay_call["prompt"]
+        if not isinstance(prompt, str):
+            msg = "prompt must be str"
+            raise TypeError(msg)
+        _check_contains(prompt, "[user] q1", "replay q1")
+        _check_absent(prompt, "[user] [user]", "no nested user label")
+        _check_absent(prompt, "[assistant] [assistant]", "no nested answer label")
+        await mgr.aclose()
+
+
+async def test_forked_conversation_inherits_parent_history() -> None:
+    """Check forked conversations inherit history for incremental failover."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr, client, _storage, _pool = _make_manager(tmpdir)
+        client.script.append(_ready_ok())
+        await mgr.run_turn("parent", _prepared("q1"), deepthink=False, model_type=None)
+        conv = await mgr.get_or_create("parent")
+        forked = await mgr.get_or_create("forked-child")
+        ref = ConvRef(
+            conversation_key="parent",
+            account_index=conv.account_index,
+            account_token=conv.account_token or "",
+            deepseek_session_id=conv.deepseek_session_id or "",
+            parent_message_id=conv.parent_message_id,
+            turns=1,
+            updated_at=time.time(),
+        )
+        mgr.inherit_from_ref(forked, ref, history=True)
+        _check_equal(forked.history, conv.history, "inherited history")
+        _check_equal(
+            forked.deepseek_session_id,
+            conv.deepseek_session_id,
+            "sticky session",
+        )
+        branch = await mgr.get_or_create("forked-branch")
+        mgr.inherit_from_ref(branch, ref, history=False)
+        _check_equal(branch.history, [], "branch stays self-contained")
+        _check_equal(
+            branch.deepseek_session_id,
+            conv.deepseek_session_id,
+            "branch sticky session",
+        )
+        await mgr.aclose()
+
+
 if __name__ == "__main__":
     unittest.main()

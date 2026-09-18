@@ -22,6 +22,10 @@ from test_turn_recovery import (
     test_deterministic_rejection_does_not_rotate,
     test_failed_empty_conversation_leaves_no_row,
     test_failure_invalidates_stale_prefix_refs,
+    test_first_turn_failover_replays_without_double_labels,
+    test_followup_failover_replays_without_account_affinity,
+    test_followup_stays_sticky_without_failover,
+    test_forked_conversation_inherits_parent_history,
     test_midstream_failure_recovers_with_full_replay,
     test_moderation_does_not_rotate_accounts,
     test_muted_account_is_quarantined_without_fanout,
@@ -126,6 +130,26 @@ class TestSQLitePersistence(unittest.TestCase):
     def test_stream_moderation_no_rotation() -> None:
         """Check stream moderation fails fast."""
         asyncio.run(test_stream_moderation_does_not_rotate())
+
+    @staticmethod
+    def test_followup_failover_replays() -> None:
+        """Check follow-up failover replays history on a new account."""
+        asyncio.run(test_followup_failover_replays_without_account_affinity())
+
+    @staticmethod
+    def test_followup_sticky_session() -> None:
+        """Check healthy follow-ups reuse the pinned session."""
+        asyncio.run(test_followup_stays_sticky_without_failover())
+
+    @staticmethod
+    def test_first_turn_replay_labels() -> None:
+        """Check first-turn retry does not nest role labels."""
+        asyncio.run(test_first_turn_failover_replays_without_double_labels())
+
+    @staticmethod
+    def test_fork_inherits_history() -> None:
+        """Check prefix forks inherit parent history."""
+        asyncio.run(test_forked_conversation_inherits_parent_history())
 
 
 if __name__ == "__main__":

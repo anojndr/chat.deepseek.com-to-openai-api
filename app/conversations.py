@@ -337,6 +337,31 @@ class ConversationManager:
         """Persist one conversation to storage."""
         self._persist_conversation(conv)
 
+    def inherit_from_ref(
+        self,
+        conv: Conversation,
+        ref: ConvRef,
+        *,
+        history: bool,
+    ) -> None:
+        """Pin a forked conversation to a parent checkpoint.
+
+        Args:
+            conv: Forked conversation receiving the checkpoint.
+            ref: Stored parent checkpoint with session and parent ids.
+            history: Whether to copy the parent transcript for failover replay.
+
+        """
+        conv.account_index = ref.account_index
+        conv.account_token = ref.account_token
+        conv.deepseek_session_id = ref.deepseek_session_id
+        conv.parent_message_id = ref.parent_message_id
+        if history:
+            parent = self.transcript(ref.conversation_key)
+            if parent:
+                conv.history = list(parent)
+        self._persist_conversation(conv)
+
     def test_hook_record_history(
         self,
         conv: Conversation,
@@ -558,11 +583,22 @@ class ConversationManager:
     def _replay_prompt(conv: Conversation, prepared: PreparedTurn) -> PreparedTurn:
         """Rebuild a first-turn prompt from history after failover.
 
+        History entries recorded from a failed full first-turn prompt may
+        already carry role labels, so keep pre-labeled lines verbatim.
+
         Returns:
             The replayed turn.
 
         """
-        lines = [f"[{msg['role']}] {msg['content']}" for msg in conv.history]
+        lines: list[str] = []
+        for msg in conv.history:
+            content = msg["content"]
+            if content.lstrip().startswith(
+                ("[user]", "[assistant]", "[tool result]", "[system"),
+            ):
+                lines.append(content)
+            else:
+                lines.append(f"[{msg['role']}] {content}")
         lines.append(prepared.prompt)
         return PreparedTurn(prompt="\n\n".join(lines).strip(), files=prepared.files)
 

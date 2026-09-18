@@ -599,16 +599,13 @@ async def _resolve_conversation(hashes: list[str]) -> tuple[str, bool]:
         return key, True
     # Fork into a distinct instance referencing the parent checkpoint; only
     # continue incrementally when the prefix reaches the parent message.
+    # Incremental follow-ups send only the latest message upstream, so the
+    # fork must carry the parent transcript for failover replay. Branches
+    # send the full history as their own prompt and stay self-contained.
     is_immediate_parent = matched_len == len(hashes) - 1
     key = f"auto:{uuid.uuid4().hex}"
     conv = await manager().get_or_create(key)
-    conv.account_index = ref.account_index
-    conv.account_token = ref.account_token
-    conv.deepseek_session_id = ref.deepseek_session_id
-    conv.parent_message_id = ref.parent_message_id
-    # Persist the inherited checkpoint now: until the first upstream event
-    # the row otherwise looks brand-new, hiding mid-flight state.
-    manager().persist_conversation(conv)
+    manager().inherit_from_ref(conv, ref, history=is_immediate_parent)
     return key, not is_immediate_parent
 
 
